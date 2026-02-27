@@ -3,16 +3,19 @@ import {
   ActivityIndicator,
   FlatList,
   Image,
+  Modal,
   StyleSheet,
   Text,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { ResizeMode, Video } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { fetchConversationMessages } from '../services';
+import { fetchConversationMessages, fetchConversationReaders } from '../services';
+import type { ConversationReader } from '../services';
 import type { Message } from '../types';
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
 import { colors } from '../../../theme/colors';
@@ -75,6 +78,9 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   const onEndReachedRef = useRef(false);
   const flatListRef = useRef<FlatList<Message>>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [readers, setReaders] = useState<ConversationReader[]>([]);
+  const [readersLoading, setReadersLoading] = useState(false);
+  const [showReadersPopover, setShowReadersPopover] = useState(false);
 
   const isMedia = (m: Message) =>
     (m.type === 'image' || m.type === 'video') && (m.mediaUrl || m.thumbnailUrl);
@@ -89,6 +95,8 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
           type: m.type === 'image' ? ('image' as const) : ('video' as const),
           uri: m.mediaUrl || m.thumbnailUrl || '',
           thumbnailUri: m.thumbnailUrl || m.mediaUrl || undefined,
+          label: conversationName || 'Chat',
+          timeLabel: formatTime(m.timestamp),
         })),
     [messages]
   );
@@ -134,6 +142,30 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
       cancelled = true;
     };
   }, [conversationId, area]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        setReadersLoading(true);
+        const data = await fetchConversationReaders(conversationId);
+        if (!cancelled) {
+          setReaders(data);
+        }
+      } catch {
+        if (!cancelled) {
+          setReaders([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setReadersLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId]);
 
   const loadOlder = useCallback(async () => {
     if (loadingOlder || !hasMore || !nextCursor) return;
@@ -284,11 +316,13 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
             {mediaGroup ? (
               <View style={styles.bubbleMediaColumn}>
                 <View style={styles.mediaGrid}>
-                  {mediaGroup.slice(0, 3).map((m, idx) => {
+                  {mediaGroup.slice(0, Math.min(mediaGroup.length, 4)).map((m, idx) => {
                     const isVideo = m.type === 'video';
                     const mediaUri = m.thumbnailUrl || m.mediaUrl || '';
-                    const isLastAndMore =
-                      mediaGroup.length > 3 && idx === 2;
+                    const isLastCell = idx === 3;
+                    const hasMore = mediaGroup.length > 4;
+                    const showMoreOverlay = isLastCell && hasMore;
+                    const moreCount = hasMore ? mediaGroup.length - 3 : 0;
                     return (
                       <TouchableOpacity
                         key={m.id}
@@ -320,9 +354,9 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                             <Ionicons name="play-circle" size={32} color="rgba(255,255,255,0.95)" />
                           </View>
                         )}
-                        {isLastAndMore && (
+                        {showMoreOverlay && (
                           <View style={styles.mediaGridMoreOverlay} pointerEvents="none">
-                            <Text style={styles.mediaGridMoreText}>+{mediaGroup.length - 3}</Text>
+                            <Text style={styles.mediaGridMoreText}>+{moreCount}</Text>
                           </View>
                         )}
                       </TouchableOpacity>
@@ -335,6 +369,12 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
               </View>
             ) : (item.type === 'image' || item.type === 'video') && (item.mediaUrl || item.thumbnailUrl) ? (
               <View style={styles.bubbleMediaColumn}>
+                {/* Small label above the preview with name/number */}
+                {!!conversationName && (
+                  <Text style={styles.mediaTitleAbove} numberOfLines={1}>
+                    {conversationName}
+                  </Text>
+                )}
                 {item.type === 'video' ? (
                   <TouchableOpacity
                     activeOpacity={0.85}
@@ -358,6 +398,12 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                         isLooping={false}
                       />
                     )}
+                    {/* Time overlay on bottom-right of preview */}
+                    <View style={styles.mediaTimestampOverlay}>
+                      <Text style={styles.mediaTimestampText}>
+                        {formatTime(item.timestamp)}
+                      </Text>
+                    </View>
                     <View style={styles.videoPlayOverlay} pointerEvents="none">
                       <Ionicons name="play-circle" size={52} color="rgba(255,255,255,0.95)" />
                     </View>
@@ -373,12 +419,13 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                       style={styles.mediaImage}
                       resizeMode="cover"
                     />
+                    <View style={styles.mediaTimestampOverlay}>
+                      <Text style={styles.mediaTimestampText}>
+                        {formatTime(item.timestamp)}
+                      </Text>
+                    </View>
                   </TouchableOpacity>
                 )}
-                {(item.displayText || item.content) ? (
-                  <Text style={styles.bubbleText}>{item.displayText || item.content}</Text>
-                ) : null}
-                <Text style={styles.bubbleTime}>{formatTime(item.timestamp)}</Text>
               </View>
             ) : (
               <>
@@ -429,6 +476,44 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
             <View style={styles.templatePill}>
               <Text style={styles.templatePillText}>Template only</Text>
             </View>
+            {readers.length > 0 && (
+              <TouchableOpacity
+                activeOpacity={0.8}
+                onPress={() => setShowReadersPopover(true)}
+                style={styles.readersContainer}
+              >
+                <View style={styles.readersAvatarStack}>
+                  {readers.slice(0, 3).map((r, idx) => {
+                    const initials = getInitials(r.name);
+                    return (
+                      <View
+                        key={r.userId ?? `${idx}`}
+                        style={[
+                          styles.readerAvatar,
+                          idx > 0 && styles.readerAvatarOverlap,
+                        ]}
+                      >
+                        {r.avatar ? (
+                          <Image
+                            source={{ uri: r.avatar }}
+                            style={styles.readerAvatarImage}
+                          />
+                        ) : (
+                          <Text style={styles.readerAvatarInitials}>
+                            {initials}
+                          </Text>
+                        )}
+                      </View>
+                    );
+                  })}
+                </View>
+                {readers.length > 3 && (
+                  <Text style={styles.readersCountText}>
+                    +{readers.length - 3}
+                  </Text>
+                )}
+              </TouchableOpacity>
+            )}
             <TouchableOpacity
               style={styles.moreBtn}
               hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
@@ -438,6 +523,45 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
           </View>
         </SafeAreaView>
       </View>
+
+      <Modal
+        visible={showReadersPopover}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowReadersPopover(false)}
+      >
+        <TouchableWithoutFeedback onPress={() => setShowReadersPopover(false)}>
+          <View style={styles.readersOverlay}>
+            <TouchableWithoutFeedback>
+              <View style={styles.readersPopover}>
+                <Text style={styles.readersPopoverTitle}>Seen by:</Text>
+                {readers.map((r) => {
+                  const initials = getInitials(r.name);
+                  return (
+                    <View key={r.userId} style={styles.readersPopoverRow}>
+                      <View style={styles.readersPopoverAvatar}>
+                        {r.avatar ? (
+                          <Image
+                            source={{ uri: r.avatar }}
+                            style={styles.readersPopoverAvatarImage}
+                          />
+                        ) : (
+                          <Text style={styles.readersPopoverAvatarInitials}>
+                            {initials}
+                          </Text>
+                        )}
+                      </View>
+                      <Text style={styles.readersPopoverItem} numberOfLines={1}>
+                        {r.name || 'Unknown'}
+                      </Text>
+                    </View>
+                  );
+                })}
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
 
       <View style={styles.chatArea}>
         {loading && (
@@ -565,6 +689,94 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#D93025',
   },
+  readersContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginRight: 4,
+  },
+  readersAvatarStack: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  readerAvatar: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: colors.background,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: colors.backgroundSecondary,
+  },
+  readerAvatarOverlap: {
+    marginLeft: -8,
+  },
+  readerAvatarImage: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 11,
+  },
+  readerAvatarInitials: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: colors.textSecondary,
+  },
+  readersCountText: {
+    marginLeft: 4,
+    fontSize: 11,
+    color: colors.textSecondary,
+  },
+  readersOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    justifyContent: 'flex-start',
+    alignItems: 'flex-end',
+    paddingTop: 56,
+    paddingRight: 12,
+  },
+  readersPopover: {
+    minWidth: 140,
+    maxWidth: 220,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: '#111',
+  },
+  readersPopoverTitle: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#fff',
+    marginBottom: 4,
+  },
+  readersPopoverRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 2,
+  },
+  readersPopoverAvatar: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: colors.backgroundSecondary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 6,
+  },
+  readersPopoverAvatarImage: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 10,
+  },
+  readersPopoverAvatarInitials: {
+    fontSize: 9,
+    fontWeight: '600',
+    color: colors.textSecondary,
+  },
+  readersPopoverItem: {
+    fontSize: 12,
+    color: '#f5f5f5',
+    flexShrink: 1,
+  },
   moreBtn: {
     padding: 4,
   },
@@ -620,12 +832,63 @@ const styles = StyleSheet.create({
     borderColor: colors.primary,
   },
   mediaWrap: {
-    width: 240,
+    width: 260,
     maxWidth: '100%',
-    height: 200,
-    borderRadius: 8,
+    height: 180,
+    borderRadius: 4,
     overflow: 'hidden',
+    marginBottom: 2,
+  },
+  mediaTitleAbove: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: colors.textSecondary,
     marginBottom: 4,
+    marginLeft: 4,
+  },
+  mediaTimestampOverlay: {
+    position: 'absolute',
+    right: 6,
+    bottom: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  mediaTimestampText: {
+    fontSize: 11,
+    color: '#E9EDEF',
+  },
+  mediaOverlayTopLeft: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    maxWidth: '80%',
+  },
+  mediaOverlayTitle: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#C8F36A',
+  },
+  mediaOverlayBottomRight: {
+    position: 'absolute',
+    right: 8,
+    bottom: 8,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+  },
+  mediaOverlayTime: {
+    fontSize: 10,
+    fontWeight: '500',
+    color: '#fff',
   },
   mediaGrid: {
     flexDirection: 'row',
@@ -636,7 +899,7 @@ const styles = StyleSheet.create({
   mediaGridItem: {
     width: '48%',
     aspectRatio: 1,
-    borderRadius: 8,
+    borderRadius: 4,
     overflow: 'hidden',
     marginBottom: 4,
   },

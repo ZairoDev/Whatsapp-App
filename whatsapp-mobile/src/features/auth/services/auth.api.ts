@@ -1,6 +1,6 @@
 import type { LoginResponse, VerifyOtpResponse, ResendOtpResponse } from '../types';
 
-const AUTH_BASE_URL = 'http://192.168.1.20:3000/api';
+const AUTH_BASE_URL = process.env.EXPO_PUBLIC_API_URL ?? 'https://adminstro.in/api';
 const TIMEOUT_MS = 15000;
 
 type ApiError = Error & {

@@ -31,7 +31,7 @@ function MediaSlide({ item }: { item: MediaGalleryItem }) {
         <Video
           source={{ uri: mediaUri }}
           style={slideStyles.media}
-          resizeMode={ResizeMode.CONTAIN}
+          resizeMode={ResizeMode.COVER}
           useNativeControls
           shouldPlay
           isLooping={false}
@@ -43,7 +43,7 @@ function MediaSlide({ item }: { item: MediaGalleryItem }) {
           <Image
             source={{ uri: mediaUri }}
             style={slideStyles.media}
-            resizeMode="contain"
+            resizeMode="cover"
           />
         </View>
       )}
@@ -69,6 +69,34 @@ const slideStyles = StyleSheet.create({
     backgroundColor: 'black',
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  topLabelContainer: {
+    position: 'absolute',
+    top: 12,
+    left: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+  },
+  topLabelText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#C8F36A', // WhatsApp-like green
+  },
+  bottomLabelContainer: {
+    position: 'absolute',
+    right: 12,
+    bottom: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 6,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+  },
+  bottomLabelText: {
+    fontSize: 11,
+    fontWeight: '500',
+    color: '#fff',
   },
 });
 

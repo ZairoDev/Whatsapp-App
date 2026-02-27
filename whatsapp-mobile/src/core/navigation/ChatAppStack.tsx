@@ -23,6 +23,8 @@ export type ChatAppStackParamList = {
       type: 'image' | 'video';
       uri: string;
       thumbnailUri?: string;
+      label?: string;
+      timeLabel?: string;
     }[];
     initialIndex: number;
   };

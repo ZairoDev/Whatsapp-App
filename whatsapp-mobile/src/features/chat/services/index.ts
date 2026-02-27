@@ -230,6 +230,14 @@ export async function sendMessage(
   return data;
 }
 
+export interface ConversationReader {
+  userId: string;
+  name: string;
+  avatar: string | null;
+  lastReadAt?: number;
+  lastReadMessageId?: string;
+}
+
 interface UnifiedSearchApiResponse {
   success?: boolean;
   query?: string;
@@ -323,4 +331,47 @@ export async function searchConversations(
       messageTimestamp,
     };
   });
+}
+
+interface ConversationReadersApiResponse {
+  success?: boolean;
+  readers?: Array<{
+    userId?: string;
+    name?: string;
+    avatar?: string | null;
+    lastReadAt?: string | number | Date;
+    lastReadMessageId?: string;
+  }>;
+}
+
+export async function fetchConversationReaders(
+  conversationId: string
+): Promise<ConversationReader[]> {
+  if (!conversationId) return [];
+  try {
+    const { data } = await api.get<ConversationReadersApiResponse>(
+      `/whatsapp/conversations/${conversationId}/readers`
+    );
+    const raw = data?.readers ?? [];
+    return raw.map((r) => {
+      const ts = r.lastReadAt;
+      const lastReadAt =
+        typeof ts === 'number'
+          ? ts
+          : ts instanceof Date
+            ? ts.getTime()
+            : typeof ts === 'string'
+              ? new Date(ts).getTime()
+              : undefined;
+      return {
+        userId: (r.userId ?? '') as string,
+        name: (r.name ?? 'Unknown') as string,
+        avatar: (r.avatar ?? null) as string | null,
+        lastReadAt,
+        lastReadMessageId: r.lastReadMessageId as string | undefined,
+      };
+    });
+  } catch {
+    return [];
+  }
 }

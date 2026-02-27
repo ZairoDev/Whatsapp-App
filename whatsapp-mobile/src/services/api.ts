@@ -26,11 +26,18 @@ api.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
-// Response interceptor (e.g. handle 401, transform errors)
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
-    // if (error.response?.status === 401) { /* logout */ }
+  async (error) => {
+    const url = error?.config?.url ?? 'unknown';
+    const status = error?.response?.status;
+    const msg = error?.response?.data?.error ?? error?.message ?? '';
+    console.warn(`[API ${status ?? '?'}] ${error?.config?.method?.toUpperCase() ?? '?'} ${url} — ${msg}`);
+
+    if (status === 401 || status === 403) {
+      await useAuthStore.getState().clearToken();
+    }
+
     return Promise.reject(error);
   }
 );
