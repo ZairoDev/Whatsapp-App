@@ -39,7 +39,8 @@ function mapApiConversation(c: Record<string, unknown>): Conversation {
           : undefined;
   const unreadCount = typeof c.unreadCount === 'number' ? c.unreadCount : 0;
   const avatar = (c.participantProfilePic ?? c.avatar) as string | undefined;
-  return { id, name, lastMessage, lastMessageAt, unreadCount, avatar };
+  const phone = (c.participantPhone as string) ?? undefined;
+  return { id, name, lastMessage, lastMessageAt, unreadCount, avatar, phone };
 }
 
 /** Response shape from GET /api/whatsapp/conversations */
@@ -236,6 +237,192 @@ export interface ConversationReader {
   avatar: string | null;
   lastReadAt?: number;
   lastReadMessageId?: string;
+}
+
+/** WhatsApp template component (HEADER, BODY, BUTTONS, FOOTER) */
+export interface WhatsAppTemplateComponent {
+  type: string;
+  format?: string;
+  text?: string;
+  url?: string;
+  example?: { body_text?: string[]; header_text?: string[]; header_handle?: string[] };
+  buttons?: Array<{ type: string; text?: string; url?: string }>;
+  [key: string]: unknown;
+}
+
+/** WhatsApp message template from GET /api/whatsapp/templates */
+export interface WhatsAppTemplate {
+  id?: string;
+  name: string;
+  language?: string;
+  status?: string;
+  components?: WhatsAppTemplateComponent[];
+}
+
+/** Extract {{1}}, {{2}}, etc. from template components in order */
+export function getTemplateVariables(template: WhatsAppTemplate): string[] {
+  const seen = new Set<number>();
+  const ordered: number[] = [];
+
+  const extractFrom = (str: string | undefined) => {
+    if (typeof str !== 'string') return;
+    const regex = /\{\{(\d+)\}\}/g;
+    let m;
+    while ((m = regex.exec(str)) !== null) {
+      const n = parseInt(m[1], 10);
+      if (!seen.has(n)) {
+        seen.add(n);
+        ordered.push(n);
+      }
+    }
+  };
+
+  for (const comp of template.components ?? []) {
+    if (comp.type === 'HEADER' && comp.format === 'TEXT') extractFrom(comp.text);
+    if (comp.type === 'BODY') extractFrom(comp.text);
+    if (comp.type === 'BUTTONS' && Array.isArray(comp.buttons)) {
+      for (const btn of comp.buttons) {
+        if (btn.type === 'URL' && btn.url) extractFrom(btn.url);
+      }
+    }
+  }
+  ordered.sort((a, b) => a - b);
+  return ordered.map((n) => `{{${n}}}`);
+}
+
+/** WhatsApp template component for sending (header, body, button) */
+export type WhatsAppSendComponent =
+  | { type: 'header'; parameters: Array<{ type: string; text: string }> }
+  | { type: 'body'; parameters: Array<{ type: string; text: string }> }
+  | { type: 'button'; sub_type: 'url'; index: number; parameters: Array<{ type: string; text: string }> };
+
+/** Build WhatsApp API components array from template + flat parameter values */
+export function buildTemplateComponents(
+  template: WhatsAppTemplate,
+  values: string[]
+): WhatsAppSendComponent[] {
+  const components: WhatsAppSendComponent[] = [];
+  let valueIdx = 0;
+
+  const consumeParams = (count: number) => {
+    const params: Array<{ type: string; text: string }> = [];
+    for (let i = 0; i < count && valueIdx < values.length; i++) {
+      params.push({ type: 'text', text: (values[valueIdx++] ?? '').trim() });
+    }
+    return params;
+  };
+
+  const countVarsIn = (str: string | undefined): number => {
+    if (typeof str !== 'string') return 0;
+    const matches = str.match(/\{\{\d+\}\}/g);
+    return matches ? matches.length : 0;
+  };
+
+  for (const comp of template.components ?? []) {
+    if (comp.type === 'HEADER' && comp.format === 'TEXT') {
+      const n = countVarsIn(comp.text);
+      if (n > 0) {
+        components.push({ type: 'header', parameters: consumeParams(n) });
+      }
+    }
+    if (comp.type === 'BODY') {
+      const n = countVarsIn(comp.text);
+      if (n > 0) {
+        components.push({ type: 'body', parameters: consumeParams(n) });
+      }
+    }
+    if (comp.type === 'BUTTONS' && Array.isArray(comp.buttons)) {
+      let btnIdx = 0;
+      for (const btn of comp.buttons) {
+        if (btn.type === 'URL' && btn.url && countVarsIn(btn.url) > 0) {
+          components.push({
+            type: 'button',
+            sub_type: 'url',
+            index: btnIdx,
+            parameters: consumeParams(1),
+          });
+        }
+        btnIdx++;
+      }
+    }
+  }
+  return components;
+}
+
+/** Build preview text from template with values substituted for {{1}}, {{2}}, etc. */
+export function getTemplatePreview(
+  template: WhatsAppTemplate,
+  values: string[]
+): { header?: string; body?: string; footer?: string } {
+  const replaceVars = (str: string | undefined): string => {
+    if (typeof str !== 'string') return '';
+    const vars = getTemplateVariables(template);
+    let out = str;
+    vars.forEach((v, i) => {
+      const val = values[i]?.trim() ?? '';
+      out = out.replace(new RegExp(`\\{\\{${i + 1}\\}\\}`, 'g'), val);
+    });
+    return out;
+  };
+
+  const result: { header?: string; body?: string; footer?: string } = {};
+  for (const comp of template.components ?? []) {
+    if (comp.type === 'HEADER' && comp.format === 'TEXT' && comp.text) {
+      result.header = replaceVars(comp.text);
+    }
+    if (comp.type === 'BODY' && comp.text) {
+      result.body = replaceVars(comp.text);
+    }
+    if (comp.type === 'FOOTER' && comp.text) {
+      result.footer = comp.text; // footer typically has no vars
+    }
+  }
+  return result;
+}
+
+interface TemplatesApiResponse {
+  success?: boolean;
+  templates?: WhatsAppTemplate[];
+}
+
+export async function fetchWhatsAppTemplates(): Promise<WhatsAppTemplate[]> {
+  const { data } = await api.get<TemplatesApiResponse>('/whatsapp/templates');
+  const list = data?.templates;
+  return Array.isArray(list) ? list : [];
+}
+
+export interface SendTemplateParams {
+  /** Recipient phone (E.164) - optional when conversationId provided (backend will resolve) */
+  to?: string;
+  /** Full template object for building components */
+  template: WhatsAppTemplate;
+  /** Values for {{1}}, {{2}}, etc. in order */
+  parameters: string[];
+  /** Conversation ID - required for DB association; backend uses this to resolve `to` if not provided */
+  conversationId?: string;
+  /** Filled template text for display in DB */
+  templateText?: string;
+}
+
+export async function sendTemplate(params: SendTemplateParams): Promise<{ success?: boolean; messageId?: string }> {
+  const { to, template, parameters, conversationId, templateText } = params;
+  const languageCode = template.language ?? 'en';
+  const components = buildTemplateComponents(template, parameters);
+  const body: Record<string, unknown> = {
+    templateName: template.name,
+    languageCode,
+    components,
+    conversationId,
+    templateText,
+  };
+  if (to?.trim()) {
+    body.to = to.replace(/\D/g, '');
+  }
+  const { data } = await api.post<{ success?: boolean; messageId?: string }>(
+    '/whatsapp/send-template',
+    body
+  );
+  return data ?? {};
 }
 
 interface UnifiedSearchApiResponse {

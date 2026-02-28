@@ -13,6 +13,7 @@ export type ChatAppStackParamList = {
     conversationId: string;
     area: 'athens' | 'thessaloniki';
     conversationName?: string;
+    participantPhone?: string;
     highlightMessageId?: string;
     highlightTimestamp?: number;
   };

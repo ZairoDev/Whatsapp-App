@@ -16,6 +16,7 @@ import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { fetchConversationMessages, fetchConversationReaders } from '../services';
 import type { ConversationReader } from '../services';
+import { MessageComposer } from '../components';
 import type { Message } from '../types';
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
 import { colors } from '../../../theme/colors';
@@ -57,6 +58,7 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     conversationId,
     area,
     conversationName,
+    participantPhone,
     highlightMessageId,
     highlightTimestamp,
   } = route.params;
@@ -584,37 +586,24 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
         )}
       </View>
 
-      <View style={styles.infoBar}>
-        <View style={styles.infoBarLeft}>
-          <View style={styles.infoIconWrap}>
-            <Ionicons name="lock-closed-outline" size={18} color={colors.textMuted} />
-          </View>
-          <View style={styles.infoTextBlock}>
-            <Text style={styles.infoTitle}>24-hour window closed</Text>
-            <Text style={styles.infoSubtitle}>
-              You can only send template messages
-            </Text>
-          </View>
-        </View>
-        <TouchableOpacity style={styles.infoButton}>
-          <Ionicons name="documents-outline" size={16} color="#fff" />
-          <Text style={styles.infoButtonText}>Send Template</Text>
-        </TouchableOpacity>
-      </View>
-
-      <View style={styles.inputBar}>
-        <TouchableOpacity style={styles.inputIconBtn}>
-          <Ionicons name="add" size={24} color={colors.textMuted} />
-        </TouchableOpacity>
-        <View style={styles.inputBox}>
-          <Text style={styles.inputPlaceholder}>
-            Send a template message...
-          </Text>
-        </View>
-        <TouchableOpacity style={styles.inputIconBtn}>
-          <Ionicons name="mic-outline" size={22} color={colors.textMuted} />
-        </TouchableOpacity>
-      </View>
+      <MessageComposer
+        conversationId={conversationId}
+        participantPhone={participantPhone}
+        templateOnly
+        onMessageSent={() => {
+          // Refresh messages after sending template
+          (async () => {
+            try {
+              const result = await fetchConversationMessages(conversationId, area, 20);
+              const apiMessages = result.messages ?? [];
+              const newestFirst = [...apiMessages].reverse();
+              setMessages(newestFirst);
+            } catch {
+              // ignore
+            }
+          })();
+        }}
+      />
     </View>
   );
 }
@@ -975,82 +964,5 @@ const styles = StyleSheet.create({
   olderLoader: {
     paddingVertical: 12,
     alignItems: 'center',
-  },
-  infoBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    backgroundColor: '#FFF8E1',
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
-  },
-  infoBarLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flex: 1,
-    marginRight: 12,
-  },
-  infoIconWrap: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: '#FDEBC8',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 8,
-  },
-  infoTextBlock: {
-    flex: 1,
-  },
-  infoTitle: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: colors.text,
-  },
-  infoSubtitle: {
-    fontSize: 11,
-    color: colors.textSecondary,
-    marginTop: 2,
-  },
-  infoButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.primary,
-    borderRadius: 20,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-  },
-  infoButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#fff',
-    marginLeft: 4,
-  },
-  inputBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: colors.backgroundSecondary,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
-  },
-  inputIconBtn: {
-    paddingHorizontal: 6,
-  },
-  inputBox: {
-    flex: 1,
-    backgroundColor: colors.background,
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 14,
-    marginHorizontal: 8,
-    justifyContent: 'center',
-  },
-  inputPlaceholder: {
-    fontSize: 14,
-    color: colors.textMuted,
   },
 });

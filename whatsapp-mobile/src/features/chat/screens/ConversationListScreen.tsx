@@ -207,6 +207,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
             conversationId: item.id,
             area,
             conversationName: item.name,
+            participantPhone: item.phone,
           });
         }}
         activeOpacity={0.7}
@@ -356,6 +357,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
                                 conversationId: item.id,
                                 area,
                                 conversationName: item.name,
+                                participantPhone: item.phone,
                                 highlightMessageId: item.messageId,
                                 highlightTimestamp: item.messageTimestamp,
                               });

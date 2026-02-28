@@ -24,6 +24,8 @@ export interface Conversation {
   lastMessageAt?: number;
   unreadCount: number;
   avatar?: string;
+  /** Participant phone (E.164) for sending templates */
+  phone?: string;
 }
 
 export interface ChatState {

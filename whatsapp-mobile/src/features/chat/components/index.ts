@@ -4,3 +4,4 @@
  */
 // export { MessageBubble } from './MessageBubble';
 // export { ConversationItem } from './ConversationItem';
+export { MessageComposer } from './MessageComposer';
