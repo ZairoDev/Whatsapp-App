@@ -77,6 +77,8 @@ export function ArchivedConversationsScreen({ navigation }: Props) {
           area: 'athens', // archived is global; area is not relevant for messages API here
           conversationName: item.name,
           participantPhone: item.phone,
+          isSelf: item.isSelf,
+          templateOnly: item.templateOnly,
         });
       }}
     >

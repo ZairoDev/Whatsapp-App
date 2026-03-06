@@ -11,6 +11,7 @@ import {
   TouchableWithoutFeedback,
   View,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import {
   fetchWhatsAppTemplates,
@@ -29,6 +30,16 @@ interface MessageComposerProps {
   /** When false: normal WhatsApp input. When true: template-only (24h window closed) */
   templateOnly?: boolean;
   onMessageSent?: () => void;
+  /**
+   * Called immediately when user hits send so the parent can show an optimistic
+   * bubble with status='sending'. Returns a temp id the parent assigned.
+   */
+  onOptimisticAdd?: (content: string) => string;
+  /**
+   * Called once the API resolves. Pass status='failed' on error so the parent
+   * can update the bubble's icon. On success, the parent re-fetches.
+   */
+  onOptimisticSetStatus?: (tempId: string, status: 'sent' | 'failed') => void;
 }
 
 export function MessageComposer({
@@ -36,7 +47,10 @@ export function MessageComposer({
   participantPhone,
   templateOnly = false,
   onMessageSent,
+  onOptimisticAdd,
+  onOptimisticSetStatus,
 }: MessageComposerProps) {
+  const insets = useSafeAreaInsets();
   const [text, setText] = useState('');
   const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
   const [templatesLoading, setTemplatesLoading] = useState(false);
@@ -113,14 +127,25 @@ export function MessageComposer({
   const handleSendText = useCallback(async () => {
     const content = text.trim();
     if (!content || !conversationId) return;
+    const to = participantPhone ?? '';
+
+    // Optimistically insert the bubble immediately
+    const tempId = onOptimisticAdd?.(content);
     setText('');
+
     try {
-      await sendMessage(conversationId, content, 'text');
+      await sendMessage(conversationId, to, content, 'text');
+      if (tempId) onOptimisticSetStatus?.(tempId, 'sent');
       onMessageSent?.();
     } catch {
-      setText(content); // restore on failure
+      // Show the message as failed instead of silently restoring text
+      if (tempId) {
+        onOptimisticSetStatus?.(tempId, 'failed');
+      } else {
+        setText(content); // fallback: restore if parent doesn't support optimistic
+      }
     }
-  }, [text, conversationId, onMessageSent]);
+  }, [text, conversationId, participantPhone, onMessageSent, onOptimisticAdd, onOptimisticSetStatus]);
 
   const variables = selectedTemplate ? getTemplateVariables(selectedTemplate) : [];
   const preview = selectedTemplate
@@ -149,7 +174,7 @@ export function MessageComposer({
         </View>
       )}
 
-      <View style={styles.inputBar}>
+      <View style={[styles.inputBar, { paddingBottom: Math.max(8, insets.bottom) }]}>
         <TouchableOpacity style={styles.inputIconBtn}>
           <Ionicons name="add" size={24} color={colors.textMuted} />
         </TouchableOpacity>

@@ -3,7 +3,9 @@ import {
   ActivityIndicator,
   FlatList,
   Image,
+  KeyboardAvoidingView,
   Modal,
+  Platform,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -14,7 +16,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ResizeMode, Video } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { fetchConversationMessages, fetchConversationReaders } from '../services';
+import { fetchConversationMessages, fetchConversationReaders, markConversationRead, sendReaction } from '../services';
 import type { ConversationReader } from '../services';
 import { MessageComposer } from '../components';
 import type { Message } from '../types';
@@ -61,7 +63,12 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     participantPhone,
     highlightMessageId,
     highlightTimestamp,
+    isSelf = false,
+    templateOnly: templateOnlyParam = false,
   } = route.params;
+
+  // Self-chat ("You") always sends directly — never template-only.
+  const templateOnly = isSelf ? false : templateOnlyParam;
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -83,6 +90,20 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   const [readers, setReaders] = useState<ConversationReader[]>([]);
   const [readersLoading, setReadersLoading] = useState(false);
   const [showReadersPopover, setShowReadersPopover] = useState(false);
+  const [reactionTarget, setReactionTarget] = useState<Message | null>(null);
+  const [reactionSending, setReactionSending] = useState(false);
+
+  // Mark conversation as read when screen opens
+  useEffect(() => {
+    if (!conversationId) return;
+    (async () => {
+      try {
+        await markConversationRead(conversationId);
+      } catch {
+        // non-blocking
+      }
+    })();
+  }, [conversationId]);
 
   const isMedia = (m: Message) =>
     (m.type === 'image' || m.type === 'video') && (m.mediaUrl || m.thumbnailUrl);
@@ -253,13 +274,46 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     item: Message;
     index: number;
   }) => {
+    if (item.type === 'reaction') {
+      // Reaction messages are rendered as overlays via the original message; skip standalone bubble
+      return null;
+    }
     const isOut = item.direction === 'outgoing';
     const isHighlighted = highlightedMessageId != null && item.id === highlightedMessageId;
-    const previous = index > 0 ? messages[index - 1] : undefined;
-    const previousDay =
-      previous && new Date(previous.timestamp).toDateString();
+    // FlatList is inverted: index 0 = newest (bottom), higher index = older (top).
+    // The date chip must sit above the oldest message of each day group, so we
+    // compare against the OLDER neighbor (index + 1), not the newer one (index - 1).
+    const olderNeighbor = index < messages.length - 1 ? messages[index + 1] : undefined;
+    const olderDay = olderNeighbor ? new Date(olderNeighbor.timestamp).toDateString() : undefined;
     const currentDay = new Date(item.timestamp).toDateString();
-    const showDateChip = !previous || previousDay !== currentDay;
+    const showDateChip = !olderNeighbor || olderDay !== currentDay;
+
+    // Compute status indicator for outgoing messages
+    // failed → red alert-circle, sending → clock, sent → single tick,
+    // delivered → double tick, read → double tick blue, unset → no icon
+    type StatusIcon = { name: string; color: string; isAlert: boolean };
+    let statusIcon: StatusIcon | null = null;
+    if (isOut) {
+      switch (item.status) {
+        case 'failed':
+          statusIcon = { name: 'alert-circle', color: '#FF3B30', isAlert: true };
+          break;
+        case 'sending':
+          statusIcon = { name: 'time-outline', color: colors.textMuted, isAlert: false };
+          break;
+        case 'sent':
+          statusIcon = { name: 'checkmark', color: colors.textMuted, isAlert: false };
+          break;
+        case 'delivered':
+          statusIcon = { name: 'checkmark-done', color: colors.textMuted, isAlert: false };
+          break;
+        case 'read':
+          statusIcon = { name: 'checkmark-done', color: '#34B7F1', isAlert: false };
+          break;
+        default:
+          statusIcon = null;
+      }
+    }
 
     // Group consecutive media messages of same direction sent close together
     let mediaGroup: Message[] | null = null;
@@ -302,7 +356,9 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
             </Text>
           </View>
         )}
-        <View
+        <TouchableOpacity
+          activeOpacity={0.9}
+          onLongPress={() => setReactionTarget(item)}
           style={[
             styles.bubbleWrap,
             isOut ? styles.bubbleWrapOut : styles.bubbleWrapIn,
@@ -365,9 +421,19 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                     );
                   })}
                 </View>
-                <Text style={styles.bubbleTime}>
-                  {formatTime(mediaGroup[mediaGroup.length - 1].timestamp)}
-                </Text>
+                <View style={styles.bubbleMetaRow}>
+                  <Text style={styles.bubbleTime}>
+                    {formatTime(mediaGroup[mediaGroup.length - 1].timestamp)}
+                  </Text>
+                  {statusIcon && (
+                    <Ionicons
+                      name={statusIcon.name as any}
+                      size={statusIcon.isAlert ? 15 : 14}
+                      color={statusIcon.color}
+                      style={styles.bubbleStatusIcon}
+                    />
+                  )}
+                </View>
               </View>
             ) : (item.type === 'image' || item.type === 'video') && (item.mediaUrl || item.thumbnailUrl) ? (
               <View style={styles.bubbleMediaColumn}>
@@ -432,11 +498,38 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
             ) : (
               <>
                 <Text style={styles.bubbleText}>{item.displayText || item.content}</Text>
-                <Text style={styles.bubbleTime}>{formatTime(item.timestamp)}</Text>
+                <View style={styles.bubbleMetaRow}>
+                  <Text style={styles.bubbleTime}>{formatTime(item.timestamp)}</Text>
+                  {statusIcon && (
+                    <Ionicons
+                      name={statusIcon.name as any}
+                      size={statusIcon.isAlert ? 15 : 14}
+                      color={statusIcon.color}
+                      style={styles.bubbleStatusIcon}
+                    />
+                  )}
+                </View>
               </>
             )}
           </View>
-        </View>
+          {item.reactions && item.reactions.length > 0 && (
+            <View
+              style={[
+                styles.reactionBar,
+                isOut ? styles.reactionBarOut : styles.reactionBarIn,
+              ]}
+            >
+              {item.reactions.map((r) => (
+                <View key={r.emoji} style={styles.reactionChip}>
+                  <Text style={styles.reactionChipText}>{r.emoji}</Text>
+                  {r.count > 1 && (
+                    <Text style={styles.reactionChipCount}>{r.count}</Text>
+                  )}
+                </View>
+              ))}
+            </View>
+          )}
+        </TouchableOpacity>
       </View>
     );
   };
@@ -450,8 +543,45 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
 
   const latestTimestamp = messages.length ? messages[messages.length - 1].timestamp : undefined;
 
+  // Optimistic message helpers ---------------------------------------------------
+  // Add a bubble immediately with status='sending'. Returns a stable temp id.
+  const handleOptimisticAdd = useCallback(
+    (content: string): string => {
+      const tempId = `temp-${Date.now()}-${Math.random()}`;
+      const optimistic: Message = {
+        id: tempId,
+        conversationId,
+        content,
+        displayText: content,
+        type: 'text',
+        direction: 'outgoing',
+        timestamp: Date.now(),
+        status: 'sending',
+      };
+      // messages is newest-first; unshift puts it at the bottom of the inverted list
+      setMessages((prev) => [optimistic, ...prev]);
+      return tempId;
+    },
+    [conversationId]
+  );
+
+  // After API resolves, flip the temp bubble's status (sent → refresh; failed → keep bubble red)
+  const handleOptimisticSetStatus = useCallback(
+    (tempId: string, status: 'sent' | 'failed') => {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === tempId ? { ...m, status } : m))
+      );
+    },
+    []
+  );
+  // ------------------------------------------------------------------------------
+
   return (
-    <View style={styles.container}>
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={0}
+    >
       <View style={styles.header}>
         <SafeAreaView edges={['top']} style={styles.headerSafe}>
           <View style={styles.headerLeft}>
@@ -589,9 +719,12 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
       <MessageComposer
         conversationId={conversationId}
         participantPhone={participantPhone}
-        templateOnly
+        templateOnly={templateOnly}
+        onOptimisticAdd={handleOptimisticAdd}
+        onOptimisticSetStatus={handleOptimisticSetStatus}
         onMessageSent={() => {
-          // Refresh messages after sending template
+          // After a successful send, refresh to replace the optimistic bubble
+          // with the real one from the server (which has the real id + status).
           (async () => {
             try {
               const result = await fetchConversationMessages(conversationId, area, 20);
@@ -599,12 +732,107 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
               const newestFirst = [...apiMessages].reverse();
               setMessages(newestFirst);
             } catch {
-              // ignore
+              // ignore; optimistic bubble stays
             }
           })();
         }}
       />
-    </View>
+
+      <Modal
+        visible={!!reactionTarget}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setReactionTarget(null)}
+      >
+        <TouchableWithoutFeedback onPress={() => setReactionTarget(null)}>
+          <View style={styles.reactionOverlay}>
+            <TouchableWithoutFeedback>
+              <View style={styles.reactionSheet}>
+                <Text style={styles.reactionTitle}>React to message</Text>
+                <View style={styles.reactionRow}>
+                  {['👍', '❤️', '😂', '😮', '😢', '🙏'].map((emoji) => (
+                    <TouchableOpacity
+                      key={emoji}
+                      style={styles.reactionEmojiBtn}
+                      disabled={reactionSending}
+                      onPress={async () => {
+                        if (!reactionTarget) return;
+                        const targetKey =
+                          reactionTarget.whatsappMessageId ?? reactionTarget.id;
+                        const messageId = targetKey;
+                        try {
+                          setReactionSending(true);
+
+                          // Optimistic local toggle: one reaction per user per message,
+                          // tap again on same emoji removes it, tap different emoji switches.
+                          setMessages((prev) =>
+                            prev.map((m) => {
+                              const key = m.whatsappMessageId ?? m.id;
+                              if (key !== targetKey) return m;
+                              const existing = m.reactions ?? [];
+                              const next = [...existing];
+
+                              // Find any existing self reaction
+                              const selfIdx = next.findIndex((r) => r.fromSelf);
+                              const selfEmoji =
+                                selfIdx >= 0 ? next[selfIdx].emoji : undefined;
+
+                              // Helper to decrement and maybe remove an entry
+                              const decAt = (i: number) => {
+                                const cur = next[i];
+                                const newCount = (cur.count ?? 1) - 1;
+                                if (newCount <= 0) {
+                                  next.splice(i, 1);
+                                } else {
+                                  next[i] = { ...cur, count: newCount, fromSelf: false };
+                                }
+                              };
+
+                              if (selfIdx >= 0) {
+                                if (selfEmoji === emoji) {
+                                  // Same emoji tapped again -> remove reaction
+                                  decAt(selfIdx);
+                                  return { ...m, reactions: next };
+                                }
+                                // Different emoji -> remove old self reaction first
+                                decAt(selfIdx);
+                              }
+
+                              // Add / increment the new emoji for self
+                              const idx = next.findIndex((r) => r.emoji === emoji);
+                              if (idx >= 0) {
+                                next[idx] = {
+                                  ...next[idx],
+                                  count: (next[idx].count ?? 0) + 1,
+                                  fromSelf: true,
+                                };
+                              } else {
+                                next.push({ emoji, count: 1, fromSelf: true });
+                              }
+
+                              return { ...m, reactions: next };
+                            })
+                          );
+
+                          await sendReaction(conversationId, messageId, emoji);
+                          setReactionTarget(null);
+                        } catch {
+                          // ignore for now; could show toast
+                        } finally {
+                          setReactionSending(false);
+                        }
+                      }}
+                    >
+                      <Text style={styles.reactionEmojiText}>{emoji}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -612,6 +840,9 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
+  },
+  keyboardContainer: {
+    flex: 1,
   },
   header: {
     backgroundColor: colors.backgroundSecondary,
@@ -949,6 +1180,15 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: colors.textMuted,
   },
+  bubbleMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-end',
+    marginTop: 2,
+  },
+  bubbleStatusIcon: {
+    marginLeft: 4,
+  },
   dateChipWrap: {
     alignSelf: 'center',
     backgroundColor: '#E1E4EA',
@@ -964,5 +1204,69 @@ const styles = StyleSheet.create({
   olderLoader: {
     paddingVertical: 12,
     alignItems: 'center',
+  },
+  reactionBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 2,
+  },
+  reactionBarOut: {
+    alignSelf: 'flex-end',
+    marginRight: 4,
+  },
+  reactionBarIn: {
+    alignSelf: 'flex-start',
+    marginLeft: 4,
+  },
+  reactionChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFF',
+    borderRadius: 12,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    marginHorizontal: 2,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+  },
+  reactionChipText: {
+    fontSize: 13,
+  },
+  reactionChipCount: {
+    fontSize: 11,
+    color: colors.textMuted,
+    marginLeft: 3,
+  },
+  reactionOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.25)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  reactionSheet: {
+    backgroundColor: colors.background,
+    borderRadius: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    minWidth: 220,
+    alignItems: 'center',
+  },
+  reactionTitle: {
+    fontSize: 13,
+    color: colors.textMuted,
+    marginBottom: 8,
+  },
+  reactionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  reactionEmojiBtn: {
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+  },
+  reactionEmojiText: {
+    fontSize: 24,
   },
 });

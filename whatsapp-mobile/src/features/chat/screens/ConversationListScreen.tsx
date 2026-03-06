@@ -10,7 +10,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import { useChatStore } from '../chat.store';
+import { useChatStore } from '../chat.store'; 
 import { fetchConversations, searchConversations } from '../services';
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -59,6 +59,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<FilterTab>('All');
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const loadedAreaRef = useRef<string | null>(null);
   const onEndReachedCalled = useRef(false);
 
@@ -165,10 +166,46 @@ export function ConversationListScreen({ route, navigation }: Props) {
     if (activeFilter === 'Unread') {
       list = list.filter((c) => (c.unreadCount ?? 0) > 0);
     }
+    if (activeFilter === 'Favourites') {
+      list = list.filter((c) => c.isFavorite);
+    }
     return list;
   }, [conversations, searchQuery, activeFilter]);
 
   const archivedCount = 0; // Placeholder; could come from API later
+
+  const isSelectionMode = selectedIds.length > 0;
+
+  const clearSelection = useCallback(() => {
+    setSelectedIds([]);
+  }, []);
+
+  const toggleSelected = useCallback(
+    (id: string) => {
+      setSelectedIds((prev) =>
+        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+      );
+    },
+    []
+  );
+
+  const toggleFavoriteForSelection = useCallback(() => {
+    if (selectedIds.length === 0) return;
+    const setIds = new Set(selectedIds);
+    const allFav = conversations
+      .filter((c) => setIds.has(c.id))
+      .every((c) => c.isFavorite);
+    const next = conversations.map((c) =>
+      setIds.has(c.id) ? { ...c, isFavorite: !allFav } : c
+    );
+    setConversations(next);
+    clearSelection();
+  }, [selectedIds, conversations, setConversations, clearSelection]);
+
+  const archiveSelection = useCallback(() => {
+    // Placeholder: wire to real archive endpoint when available.
+    clearSelection();
+  }, [clearSelection]);
 
   const renderHighlightedSnippet = (snippet: string | undefined, query: string) => {
     if (!snippet) {
@@ -201,14 +238,26 @@ export function ConversationListScreen({ route, navigation }: Props) {
   const renderRow = useCallback(
     ({ item }: { item: Conversation }) => (
       <TouchableOpacity
-        style={styles.row}
+        style={[
+          styles.row,
+          selectedIds.includes(item.id) && styles.rowSelected,
+        ]}
         onPress={() => {
-          navigation.navigate('ConversationDetail', {
-            conversationId: item.id,
-            area,
-            conversationName: item.name,
-            participantPhone: item.phone,
-          });
+          if (isSelectionMode) {
+            toggleSelected(item.id);
+          } else {
+            navigation.navigate('ConversationDetail', {
+              conversationId: item.id,
+              area,
+              conversationName: item.name,
+              participantPhone: item.phone,
+              isSelf: item.isSelf,
+              templateOnly: item.templateOnly,
+            });
+          }
+        }}
+        onLongPress={() => {
+          toggleSelected(item.id);
         }}
         activeOpacity={0.7}
       >
@@ -216,6 +265,16 @@ export function ConversationListScreen({ route, navigation }: Props) {
           <Text style={styles.avatarText} numberOfLines={1}>
             {getInitials(item.name)}
           </Text>
+          {selectedIds.includes(item.id) && (
+            <View style={styles.avatarSelectionBadge}>
+              <Ionicons name="checkmark" size={16} color="#fff" />
+            </View>
+          )}
+          {item.isFavorite && !selectedIds.includes(item.id) && (
+            <View style={styles.avatarFavoriteBadge}>
+              <Ionicons name="star" size={14} color="#fff" />
+            </View>
+          )}
         </View>
         <View style={styles.rowCenter}>
           <View style={styles.rowTop}>
@@ -243,7 +302,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
         </View>
       </TouchableOpacity>
     ),
-    [navigation, area]
+    [navigation, area, isSelectionMode, selectedIds, toggleSelected]
   );
 
   const renderFooter = () =>
@@ -316,7 +375,39 @@ export function ConversationListScreen({ route, navigation }: Props) {
 
   return (
     <View style={styles.container}>
-     
+      <SafeAreaView edges={['top']} style={styles.selectionSafeArea}>
+        {isSelectionMode && (
+          <View style={styles.selectionBar}>
+            <TouchableOpacity
+              style={styles.selectionBackBtn}
+              hitSlop={8}
+              onPress={clearSelection}
+            >
+              <Ionicons name="close" size={22} color="#fff" />
+            </TouchableOpacity>
+            <Text style={styles.selectionTitle}>{selectedIds.length}</Text>
+            <View style={styles.selectionActions}>
+              <TouchableOpacity
+                style={styles.selectionIconBtn}
+                hitSlop={8}
+                onPress={toggleFavoriteForSelection}
+              >
+                <Ionicons name="star" size={22} color="#fff" />
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.selectionIconBtn}
+                hitSlop={8}
+                onPress={archiveSelection}
+              >
+                <Ionicons name="archive-outline" size={22} color="#fff" />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.selectionIconBtn} hitSlop={8}>
+                <Ionicons name="ellipsis-vertical" size={20} color="#fff" />
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+      </SafeAreaView>
 
       <View style={styles.content}>
         {loading && (
@@ -360,6 +451,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
                                 participantPhone: item.phone,
                                 highlightMessageId: item.messageId,
                                 highlightTimestamp: item.messageTimestamp,
+                                templateOnly: (item as Conversation).templateOnly,
                               });
                             }}
                           >
@@ -429,6 +521,9 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
+  },
+  selectionSafeArea: {
+    backgroundColor: HEADER_GREEN,
   },
   header: {
     backgroundColor: HEADER_GREEN,
@@ -546,6 +641,29 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: colors.textSecondary,
   },
+  selectionBar: {
+    backgroundColor: HEADER_GREEN,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  selectionBackBtn: {
+    padding: 4,
+  },
+  selectionTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  selectionActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  selectionIconBtn: {
+    paddingHorizontal: 8,
+  },
   center: {
     paddingVertical: 24,
     alignItems: 'center',
@@ -567,6 +685,9 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: colors.border,
   },
+  rowSelected: {
+    backgroundColor: 'rgba(7, 94, 84, 0.08)',
+  },
   avatar: {
     width: 52,
     height: 52,
@@ -580,6 +701,28 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '600',
     color: colors.textSecondary,
+  },
+  avatarSelectionBadge: {
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: HEADER_GREEN,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarFavoriteBadge: {
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: colors.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   rowCenter: {
     flex: 1,

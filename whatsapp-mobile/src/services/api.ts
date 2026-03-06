@@ -2,10 +2,6 @@ import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
 import { API_CONFIG } from '../constants';
 import { useAuthStore } from '../features/auth/auth.store';
 
-/**
- * Configured axios instance for HTTP requests.
- * Attaches Bearer token from auth store for authenticated endpoints.
- */
 const api: AxiosInstance = axios.create({
   baseURL: API_CONFIG.BASE_URL,
   timeout: API_CONFIG.TIMEOUT_MS,
@@ -14,7 +10,7 @@ const api: AxiosInstance = axios.create({
   },
 });
 
-// Request interceptor: attach auth token so /whatsapp/conversations etc. return 200
+// Attach Bearer token on every request.
 api.interceptors.request.use(
   (config) => {
     const token = useAuthStore.getState().tokenData?.token;
@@ -29,13 +25,39 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
+    const status: number | undefined = error?.response?.status;
     const url = error?.config?.url ?? 'unknown';
-    const status = error?.response?.status;
-    const msg = error?.response?.data?.error ?? error?.message ?? '';
-    console.warn(`[API ${status ?? '?'}] ${error?.config?.method?.toUpperCase() ?? '?'} ${url} — ${msg}`);
+    const method = error?.config?.method?.toUpperCase() ?? '?';
+    const serverMsg: string =
+      error?.response?.data?.error ??
+      error?.response?.data?.message ??
+      error?.message ??
+      '';
 
-    if (status === 401 || status === 403) {
-      await useAuthStore.getState().clearToken();
+    console.warn(`[API ${status ?? 'NET'}] ${method} ${url} — ${serverMsg}`);
+
+    // No HTTP response at all = pure network/timeout error.
+    // Do NOT clear auth state — the device may simply be offline.
+    if (!error?.response) {
+      const netError = new Error(
+        'Network error — please check your internet connection.'
+      );
+      (netError as any).isNetworkError = true;
+      return Promise.reject(netError);
+    }
+
+    // Any HTTP 401 = token is definitively invalid/expired.
+    if (status === 401) {
+      await useAuthStore.getState().markSessionExpired();
+      return Promise.reject(error);
+    }
+
+    // This backend returns HTTP 500 for expired/invalid tokens instead of 401.
+    // Treat every 5xx as a session failure so the user is sent back to login
+    // automatically rather than seeing a raw error string.
+    if (status !== undefined && status >= 500) {
+      await useAuthStore.getState().markSessionExpired();
+      return Promise.reject(error);
     }
 
     return Promise.reject(error);

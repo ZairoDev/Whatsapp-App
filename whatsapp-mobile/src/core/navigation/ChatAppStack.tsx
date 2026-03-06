@@ -16,6 +16,10 @@ export type ChatAppStackParamList = {
     participantPhone?: string;
     highlightMessageId?: string;
     highlightTimestamp?: number;
+    /** Backend-provided flag: 24-hour window expired → only templates allowed */
+    templateOnly?: boolean;
+    /** True for the "You" self-chat — always sends directly, never template-only */
+    isSelf?: boolean;
   };
   ArchiveList: undefined;
   VideoPlayer: {

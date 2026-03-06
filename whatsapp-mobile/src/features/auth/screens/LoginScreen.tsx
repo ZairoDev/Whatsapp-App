@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -10,6 +10,7 @@ import {
   ActivityIndicator,
   ScrollView,
 } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { login, getLoginErrorMessage } from '../services/auth.api';
 import { useAuthStore } from '../auth.store';
@@ -23,12 +24,21 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function LoginScreen({ navigation }: Props) {
   const setToken = useAuthStore((s) => s.setToken);
+  const sessionExpired = useAuthStore((s) => s.sessionExpired);
+  const clearSessionExpired = useAuthStore((s) => s.clearSessionExpired);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<{ email?: string; password?: string }>({});
+
+  // Dismiss the session-expired banner once the user starts interacting.
+  useEffect(() => {
+    return () => {
+      clearSessionExpired();
+    };
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
   const validate = (): boolean => {
     const next: { email?: string; password?: string } = {};
@@ -88,6 +98,15 @@ export function LoginScreen({ navigation }: Props) {
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
       >
+        {sessionExpired && (
+          <View style={styles.sessionBanner}>
+            <Ionicons name="warning-outline" size={18} color="#7A4100" />
+            <Text style={styles.sessionBannerText}>
+              Your session has expired. Please log in again.
+            </Text>
+          </View>
+        )}
+
         <Text style={styles.title}>Employee Login</Text>
         <Text style={styles.subtitle}>Sign in with your email and password</Text>
 
@@ -174,6 +193,24 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
+  },
+  sessionBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#FFF3CD',
+    borderLeftWidth: 4,
+    borderLeftColor: '#FFAB00',
+    borderRadius: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 24,
+  },
+  sessionBannerText: {
+    flex: 1,
+    fontSize: 14,
+    color: '#7A4100',
+    fontWeight: '500',
   },
   scrollContent: {
     flexGrow: 1,

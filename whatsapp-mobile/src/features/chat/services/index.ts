@@ -40,7 +40,29 @@ function mapApiConversation(c: Record<string, unknown>): Conversation {
   const unreadCount = typeof c.unreadCount === 'number' ? c.unreadCount : 0;
   const avatar = (c.participantProfilePic ?? c.avatar) as string | undefined;
   const phone = (c.participantPhone as string) ?? undefined;
-  return { id, name, lastMessage, lastMessageAt, unreadCount, avatar, phone };
+
+  // Self-chat ("You") — check backend fields that indicate a personal/notes conversation.
+  // Self-chats never use template-only mode; messages always go directly.
+  const isSelf = Boolean(
+    c.isSelf ??
+    c.isOwn ??
+    c.isSelfChat ??
+    (c.type === 'self')
+  );
+
+  // Backend may signal the 24-hour window expiry via several field names.
+  // Self-chats always bypass this — templateOnly is forced false for them.
+  const templateOnly = isSelf
+    ? false
+    : Boolean(
+        c.windowExpired ??
+        c.isWindowExpired ??
+        c.templateOnly ??
+        c.isTemplateOnly ??
+        false
+      );
+
+  return { id, name, lastMessage, lastMessageAt, unreadCount, avatar, phone, isSelf, templateOnly };
 }
 
 /** Response shape from GET /api/whatsapp/conversations */
@@ -147,7 +169,7 @@ function mapApiMessage(m: Record<string, unknown>, conversationId: string): Mess
         : typeof ts === 'string'
           ? new Date(ts).getTime()
           : 0;
-  const type = ((m.type as string) || 'text') as Message['type'];
+  let type = ((m.type as string) || 'text') as Message['type'];
   const direction = (m.direction as 'incoming' | 'outgoing') || 'incoming';
   const contentStr = typeof text === 'string' && text ? text : (typeof content === 'string' ? content : '');
   const displayStr = typeof m.displayText === 'string' ? m.displayText : contentStr;
@@ -167,15 +189,64 @@ function mapApiMessage(m: Record<string, unknown>, conversationId: string): Mess
   else if (contentObj?.video && typeof (contentObj.video as { thumbnailUrl?: string }).thumbnailUrl === 'string') thumbnailUrl = (contentObj.video as { thumbnailUrl: string }).thumbnailUrl;
   else thumbnailUrl = undefined;
 
+  const whatsappMessageId =
+    typeof m.messageId === 'string' ? (m.messageId as string) : undefined;
+  const reactedToMessageId =
+    typeof (m as any).reactedToMessageId === 'string'
+      ? ((m as any).reactedToMessageId as string)
+      : undefined;
+  const reactionEmoji =
+    typeof (m as any).reactionEmoji === 'string'
+      ? ((m as any).reactionEmoji as string)
+      : undefined;
+
+  // Map delivery/read status for outgoing messages only
+  let status: Message['status'] | undefined;
+  if (direction === 'outgoing') {
+    const rawStatus = (m as any).status as string | undefined;
+    switch (rawStatus) {
+      case 'queued':
+      case 'pending':
+        status = 'sending';
+        break;
+      case 'sent':
+        status = 'sent';
+        break;
+      case 'delivered':
+        status = 'delivered';
+        break;
+      case 'read':
+        status = 'read';
+        break;
+      case 'failed':
+      case 'error':
+        status = 'failed';
+        break;
+      default:
+        status = undefined;
+    }
+  }
+
   const msg: Message = {
     id,
     conversationId,
     content: contentStr,
     timestamp,
-    type: type === 'text' || type === 'image' || type === 'audio' || type === 'video' ? type : 'text',
+    type:
+      type === 'text' ||
+      type === 'image' ||
+      type === 'audio' ||
+      type === 'video' ||
+      type === 'reaction'
+        ? type
+        : 'text',
     direction,
     displayText: displayStr,
+    ...(status ? { status } : {}),
   };
+  if (whatsappMessageId) msg.whatsappMessageId = whatsappMessageId;
+  if (reactedToMessageId) msg.reactedToMessageId = reactedToMessageId;
+  if (reactionEmoji) msg.reactionEmoji = reactionEmoji;
   if (mediaUrl !== undefined) msg.mediaUrl = mediaUrl;
   if (thumbnailUrl !== undefined) msg.thumbnailUrl = thumbnailUrl;
   return msg;
@@ -203,10 +274,39 @@ export async function fetchConversationMessages(
     `/whatsapp/conversations/${conversationId}/messages`,
     { params }
   );
-  const raw = data?.messages;
-  const messages = Array.isArray(raw)
+  const raw = data?.messages ?? [];
+  const mapped = Array.isArray(raw)
     ? raw.map((m) => mapApiMessage(m, conversationId))
     : [];
+
+  // Separate base messages and reaction messages, then attach aggregated reactions
+  const baseMessages: Message[] = [];
+  const reactionBuckets = new Map<string, { emoji: string; count: number; fromSelf?: boolean }[]>();
+
+  for (const msg of mapped) {
+    if (msg.type !== 'reaction') {
+      baseMessages.push(msg);
+      continue;
+    }
+    const targetId = msg.reactedToMessageId;
+    if (!targetId || !msg.reactionEmoji) continue;
+
+    const key = targetId;
+    const list = reactionBuckets.get(key) ?? [];
+    let entry = list.find((r) => r.emoji === msg.reactionEmoji);
+    if (!entry) {
+      entry = { emoji: msg.reactionEmoji, count: 0, fromSelf: msg.direction === 'outgoing' };
+      list.push(entry);
+    }
+    entry.count += 1;
+    reactionBuckets.set(key, list);
+  }
+
+  const messages = baseMessages.map((m) => {
+    const key = m.whatsappMessageId ?? m.id;
+    const reactions = reactionBuckets.get(key);
+    return reactions ? { ...m, reactions } : m;
+  });
   const pagination = data?.pagination;
   const hasMore = pagination?.hasMore ?? false;
   const nextCursor = pagination?.nextCursor ?? null;
@@ -221,14 +321,38 @@ export async function fetchMessages(conversationId: string): Promise<Message[]> 
 
 export async function sendMessage(
   conversationId: string,
+  to: string,
   content: string,
   type: Message['type'] = 'text'
-): Promise<Message> {
-  const { data } = await api.post<Message>(`/conversations/${conversationId}/messages`, {
-    content,
+): Promise<void> {
+  if (!conversationId || !content.trim()) return;
+  await api.post('/whatsapp/send-message', {
+    to,
+    message: content,
+    conversationId,
     type,
   });
-  return data;
+}
+
+export async function sendReaction(
+  conversationId: string,
+  messageId: string,
+  emoji: string
+): Promise<void> {
+  if (!conversationId || !messageId || !emoji) return;
+  await api.post('/whatsapp/send-reaction', {
+    conversationId,
+    messageId,
+    emoji,
+  });
+}
+
+/** Mark a conversation as read for the current user */
+export async function markConversationRead(conversationId: string): Promise<void> {
+  if (!conversationId) return;
+  await api.post('/whatsapp/conversations/read', {
+    conversationId,
+  });
 }
 
 export interface ConversationReader {
