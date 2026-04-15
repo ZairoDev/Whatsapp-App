@@ -12,8 +12,13 @@
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
+    "notification": {
+      "icon": "./assets/icon.png",
+      "color": "#111827"
+    },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.zaidzz4.whatsappmobile"
     },
     "android": {
       "adaptiveIcon": {
@@ -22,10 +27,24 @@
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "softwareKeyboardLayoutMode": "pan"
+      "softwareKeyboardLayoutMode": "pan",
+      "package": "com.zaidzz4.whatsappmobile"
     },
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "useNextNotificationsApi": true
+        }
+      ]
+    ],
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "0537d8d3-33ef-4480-866f-e09994dabfdf"
+      }
     }
   }
 }

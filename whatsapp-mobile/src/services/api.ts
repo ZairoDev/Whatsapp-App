@@ -1,6 +1,21 @@
-import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
+import axios, { AxiosHeaders, AxiosInstance, AxiosRequestConfig } from 'axios';
 import { API_CONFIG } from '../constants';
 import { useAuthStore } from '../features/auth/auth.store';
+
+function isSessionTokenInvalid(status: number | undefined, message: string): boolean {
+  if (status !== 401 && status !== 403) return false;
+  const msg = (message || '').toLowerCase();
+  // Only treat *actual* employee/JWT auth failures as a reason to clear session.
+  // WhatsApp/Meta integration can also surface as 401/403 but should not log out the employee.
+  return (
+    msg.includes('jwt') ||
+    msg.includes('token expired') ||
+    msg.includes('invalid token') ||
+    msg.includes('unauthorized') ||
+    msg.includes('not authorized') ||
+    msg.includes('session expired')
+  );
+}
 
 const api: AxiosInstance = axios.create({
   baseURL: API_CONFIG.BASE_URL,
@@ -15,7 +30,16 @@ api.interceptors.request.use(
   (config) => {
     const token = useAuthStore.getState().tokenData?.token;
     if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
+      // Axios v1 may represent headers as an AxiosHeaders instance (with .set()),
+      // while older versions use a plain object. Support both safely.
+      const h: any = config.headers;
+      if (h && typeof h.set === 'function') {
+        h.set('Authorization', `Bearer ${token}`);
+      } else {
+        const headers = AxiosHeaders.from((config.headers ?? {}) as any);
+        headers.set('Authorization', `Bearer ${token}`);
+        config.headers = headers;
+      }
     }
     return config;
   },
@@ -39,23 +63,17 @@ api.interceptors.response.use(
     // No HTTP response at all = pure network/timeout error.
     // Do NOT clear auth state — the device may simply be offline.
     if (!error?.response) {
-      const netError = new Error(
-        'Network error — please check your internet connection.'
-      );
+      const reason =
+        typeof error?.message === 'string' && error.message
+          ? ` (${error.message})`
+          : '';
+      const netError = new Error(`Network error — please check your internet connection.${reason}`);
       (netError as any).isNetworkError = true;
       return Promise.reject(netError);
     }
 
-    // Any HTTP 401 = token is definitively invalid/expired.
-    if (status === 401) {
-      await useAuthStore.getState().markSessionExpired();
-      return Promise.reject(error);
-    }
-
-    // This backend returns HTTP 500 for expired/invalid tokens instead of 401.
-    // Treat every 5xx as a session failure so the user is sent back to login
-    // automatically rather than seeing a raw error string.
-    if (status !== undefined && status >= 500) {
+    // Only clear auth state when we are confident the employee session is invalid.
+    if (isSessionTokenInvalid(status, serverMsg)) {
       await useAuthStore.getState().markSessionExpired();
       return Promise.reject(error);
     }

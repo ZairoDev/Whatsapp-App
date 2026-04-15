@@ -2,6 +2,7 @@ import React, { type ReactNode } from 'react';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { RootNavigator } from '../navigation/RootNavigator';
+import { InAppNotificationBanner } from '../../notifications/InAppNotificationBanner';
 
 interface AppProvidersProps {
   children?: ReactNode;
@@ -14,6 +15,7 @@ export function AppProviders({ children }: AppProvidersProps) {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
+        <InAppNotificationBanner />
         {children ?? <RootNavigator />}
       </SafeAreaProvider>
     </GestureHandlerRootView>

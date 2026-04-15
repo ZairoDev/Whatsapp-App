@@ -8,6 +8,7 @@ import {
   Platform,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   TouchableWithoutFeedback,
   View,
@@ -16,12 +17,21 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ResizeMode, Video } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { fetchConversationMessages, fetchConversationReaders, markConversationRead, sendReaction } from '../services';
+import {
+  fetchConversationMessages,
+  fetchConversationReaders,
+  markConversationRead,
+  searchConversations,
+  sendMessage,
+  sendReaction,
+} from '../services';
 import type { ConversationReader } from '../services';
 import { MessageComposer } from '../components';
-import type { Message } from '../types';
+import type { Conversation, Message } from '../types';
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
 import { colors } from '../../../theme/colors';
+import { useChatStore } from '../chat.store';
+import { joinConversationRoom, leaveConversationRoom } from '../../../services/socket';
 
 type Props = NativeStackScreenProps<ChatAppStackParamList, 'ConversationDetail'>;
 
@@ -44,6 +54,18 @@ function formatTime(ts?: number): string {
   });
 }
 
+/** Same semantics as MessageComposer — remaining time until template-only. */
+function formatCountdown(ms: number): string {
+  if (ms <= 0) return '0m';
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 function getInitials(name?: string | null): string {
   if (!name) return '?';
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -55,6 +77,10 @@ function getInitials(name?: string | null): string {
 
 // Video playback happens on a dedicated full screen; here we only show a tappable thumbnail.
 
+// Module-level stable reference so selectors that fallback to an empty array
+// always return the SAME object, preventing Zustand snapshot infinite loops.
+const EMPTY_MESSAGES: Message[] = [];
+
 export function ConversationDetailScreen({ route, navigation }: Props) {
   const {
     conversationId,
@@ -65,11 +91,21 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     highlightTimestamp,
     isSelf = false,
     templateOnly: templateOnlyParam = false,
+    windowExpiresAt,
+    isDraft = false,
   } = route.params;
 
   // Self-chat ("You") always sends directly — never template-only.
   const templateOnly = isSelf ? false : templateOnlyParam;
-  const [messages, setMessages] = useState<Message[]>([]);
+  const conversationStarted = Boolean(windowExpiresAt);
+
+  // Stable empty-array sentinel so the selector never returns a new reference when
+  // the conversation key is missing — avoids Zustand snapshot infinite-loop error.
+  const messagesFromStore = useChatStore((s) => s.messages[conversationId]);
+  const messages = messagesFromStore ?? EMPTY_MESSAGES;
+  const setMessagesInStore = useChatStore((s) => s.setMessages);
+  const updateMessageStatus = useChatStore((s) => s.updateMessageStatus);
+  const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const [loading, setLoading] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -92,10 +128,47 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   const [showReadersPopover, setShowReadersPopover] = useState(false);
   const [reactionTarget, setReactionTarget] = useState<Message | null>(null);
   const [reactionSending, setReactionSending] = useState(false);
+  const [replyTarget, setReplyTarget] = useState<Message | null>(null);
+  const [forwardTarget, setForwardTarget] = useState<Message | null>(null);
+  const [forwardQuery, setForwardQuery] = useState('');
+  const [forwardSending, setForwardSending] = useState(false);
+  const [forwardError, setForwardError] = useState<string | null>(null);
+  const [remainingMs, setRemainingMs] = useState(() =>
+    windowExpiresAt ? Math.max(0, windowExpiresAt - Date.now()) : 0
+  );
+
+  useEffect(() => {
+    if (!windowExpiresAt) {
+      setRemainingMs(0);
+      return;
+    }
+    const tick = () => {
+      setRemainingMs(Math.max(0, windowExpiresAt - Date.now()));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [windowExpiresAt]);
+
+  // Must match MessageComposer so header badge and footer stay in sync.
+  const canSendFreeText =
+    isSelf ||
+    (conversationStarted && !templateOnly && remainingMs > 0);
+  const headerShowCountdown =
+    !isSelf && conversationStarted && canSendFreeText && remainingMs > 0;
+  const headerShowTemplateOnly = !isSelf && !canSendFreeText;
+
+  const countdownAccent =
+    remainingMs > 6 * 3600 * 1000
+      ? { bg: '#E6F8ED', fg: '#128C7E' }
+      : remainingMs > 2 * 3600 * 1000
+        ? { bg: '#FFF4E5', fg: '#c2410c' }
+        : { bg: '#FDE6E6', fg: '#D93025' };
 
   // Mark conversation as read when screen opens
   useEffect(() => {
-    if (!conversationId) return;
+    if (!conversationId || isDraft) return;
+    setActiveConversation(conversationId);
     (async () => {
       try {
         await markConversationRead(conversationId);
@@ -103,7 +176,10 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
         // non-blocking
       }
     })();
-  }, [conversationId]);
+    return () => {
+      setActiveConversation(null);
+    };
+  }, [conversationId, isDraft, setActiveConversation]);
 
   const isMedia = (m: Message) =>
     (m.type === 'image' || m.type === 'video') && (m.mediaUrl || m.thumbnailUrl);
@@ -143,13 +219,19 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
       try {
         setLoading(true);
         setError(null);
+        if (isDraft) {
+          setMessagesInStore(conversationId, []);
+          setNextCursor(null);
+          setHasMore(false);
+          return;
+        }
         const result = await fetchConversationMessages(conversationId, area, 20);
         if (!cancelled) {
           // setMessages(result.messages);
           const apiMessages = result.messages ?? [];
           // Store messages newest-first so with inverted FlatList the latest appears at the bottom.
           const newestFirst = [...apiMessages].reverse();
-          setMessages(newestFirst);
+          setMessagesInStore(conversationId, newestFirst);
           setNextCursor(result.nextCursor);
           setHasMore(result.hasMore);
         }
@@ -164,12 +246,25 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [conversationId, area]);
+  }, [conversationId, area, isDraft]);
+
+  // Join conversation-specific room for typing/read events and scoped updates.
+  useEffect(() => {
+    if (!conversationId || isDraft) return;
+    joinConversationRoom(conversationId);
+    return () => {
+      leaveConversationRoom(conversationId);
+    };
+  }, [conversationId, isDraft]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
+        if (isDraft) {
+          setReaders([]);
+          return;
+        }
         setReadersLoading(true);
         const data = await fetchConversationReaders(conversationId);
         if (!cancelled) {
@@ -188,7 +283,26 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [conversationId]);
+  }, [conversationId, isDraft]);
+
+  const handleDraftMessageSent = useCallback(async () => {
+    if (!isDraft || !participantPhone?.trim()) return;
+    try {
+      const results = await searchConversations(area, participantPhone);
+      if (!results.length) return;
+      const hit = results[0];
+      navigation.replace('ConversationDetail', {
+        conversationId: hit.id,
+        area,
+        conversationName: hit.name,
+        participantPhone: hit.phone,
+        templateOnly: false,
+        isDraft: false,
+      });
+    } catch {
+      // non-blocking
+    }
+  }, [isDraft, participantPhone, area, navigation]);
 
   const loadOlder = useCallback(async () => {
     if (loadingOlder || !hasMore || !nextCursor) return;
@@ -203,11 +317,12 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
         nextCursor.messageId,
         nextCursor.timestamp
       );
-      // setMessages((prev) => [...result.messages, ...prev]);
       const olderChunk = result.messages ?? [];
       const olderNewestFirst = [...olderChunk].reverse();
-      // For newest-first array, append still older messages at the end.
-      setMessages((prev) => [...prev, ...olderNewestFirst]);
+      // Read current messages from store at call-time to avoid stale closure and
+      // to avoid adding `messages` to deps (which would recreate cb on every render).
+      const current = useChatStore.getState().messages[conversationId] ?? [];
+      setMessagesInStore(conversationId, [...current, ...olderNewestFirst]);
       setNextCursor(result.nextCursor);
       setHasMore(result.hasMore);
     } catch {
@@ -543,6 +658,56 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
 
   const latestTimestamp = messages.length ? messages[messages.length - 1].timestamp : undefined;
 
+  const allConversations = useChatStore((s) => s.conversations) as Conversation[];
+  const forwardCandidates = useMemo(() => {
+    const q = forwardQuery.trim().toLowerCase();
+    const list = (allConversations ?? []).filter((c) => c.id && c.id !== conversationId);
+    if (!q) return list;
+    return list.filter((c) => {
+      const name = (c.name ?? '').toLowerCase();
+      const phone = (c.phone ?? '').toLowerCase();
+      return name.includes(q) || phone.includes(q);
+    });
+  }, [allConversations, forwardQuery, conversationId]);
+
+  const replyPreview = useMemo(() => {
+    if (!replyTarget) return null;
+    const base = (replyTarget.displayText || replyTarget.content || '').trim();
+    const oneLine = base.replace(/\s+/g, ' ');
+    if (oneLine) return oneLine.slice(0, 140);
+    if (replyTarget.type === 'image') return 'Image';
+    if (replyTarget.type === 'video') return 'Video';
+    if (replyTarget.type === 'audio') return 'Audio';
+    return 'Message';
+  }, [replyTarget]);
+
+  const handleForwardTo = useCallback(
+    async (target: Conversation) => {
+      if (!forwardTarget) return;
+      if (!target?.id) return;
+      const raw =
+        forwardTarget.type === 'text'
+          ? (forwardTarget.content || forwardTarget.displayText || '').trim()
+          : '';
+      if (!raw) {
+        setForwardError('Forwarding is currently supported for text messages only.');
+        return;
+      }
+      setForwardError(null);
+      setForwardSending(true);
+      try {
+        await sendMessage(target.id, target.phone ?? '', raw, 'text', area);
+        setForwardTarget(null);
+        setForwardQuery('');
+      } catch (e) {
+        setForwardError(e instanceof Error ? e.message : 'Failed to forward message');
+      } finally {
+        setForwardSending(false);
+      }
+    },
+    [forwardTarget]
+  );
+
   // Optimistic message helpers ---------------------------------------------------
   // Add a bubble immediately with status='sending'. Returns a stable temp id.
   const handleOptimisticAdd = useCallback(
@@ -558,21 +723,21 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
         timestamp: Date.now(),
         status: 'sending',
       };
-      // messages is newest-first; unshift puts it at the bottom of the inverted list
-      setMessages((prev) => [optimistic, ...prev]);
+      // Read current messages from store at call-time (not from closure) to avoid
+      // adding `messages` to deps which would recreate this cb on every new message.
+      const current = useChatStore.getState().messages[conversationId] ?? [];
+      setMessagesInStore(conversationId, [optimistic, ...current]);
       return tempId;
     },
-    [conversationId]
+    [conversationId, setMessagesInStore]
   );
 
   // After API resolves, flip the temp bubble's status (sent → refresh; failed → keep bubble red)
   const handleOptimisticSetStatus = useCallback(
     (tempId: string, status: 'sent' | 'failed') => {
-      setMessages((prev) =>
-        prev.map((m) => (m.id === tempId ? { ...m, status } : m))
-      );
+      updateMessageStatus(conversationId, tempId, status);
     },
-    []
+    [conversationId, updateMessageStatus]
   );
   // ------------------------------------------------------------------------------
 
@@ -605,9 +770,23 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
             </View>
           </View>
           <View style={styles.headerRight}>
-            <View style={styles.templatePill}>
-              <Text style={styles.templatePillText}>Template only</Text>
-            </View>
+            {headerShowCountdown && (
+              <View
+                style={[
+                  styles.templatePill,
+                  { backgroundColor: countdownAccent.bg },
+                ]}
+              >
+                <Text style={[styles.templatePillText, { color: countdownAccent.fg }]}>
+                  {formatCountdown(remainingMs)}
+                </Text>
+              </View>
+            )}
+            {headerShowTemplateOnly && (
+              <View style={styles.templatePill}>
+                <Text style={styles.templatePillText}>Template only</Text>
+              </View>
+            )}
             {readers.length > 0 && (
               <TouchableOpacity
                 activeOpacity={0.8}
@@ -719,10 +898,23 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
       <MessageComposer
         conversationId={conversationId}
         participantPhone={participantPhone}
+        area={area}
+        replyTo={
+          replyTarget && replyPreview
+            ? { id: replyTarget.id, preview: replyPreview }
+            : null
+        }
+        onCancelReply={() => setReplyTarget(null)}
         templateOnly={templateOnly}
+        windowExpiresAt={isSelf ? undefined : windowExpiresAt}
+        isSelf={isSelf}
         onOptimisticAdd={handleOptimisticAdd}
         onOptimisticSetStatus={handleOptimisticSetStatus}
         onMessageSent={() => {
+          if (isDraft) {
+            handleDraftMessageSent();
+            return;
+          }
           // After a successful send, refresh to replace the optimistic bubble
           // with the real one from the server (which has the real id + status).
           (async () => {
@@ -730,7 +922,7 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
               const result = await fetchConversationMessages(conversationId, area, 20);
               const apiMessages = result.messages ?? [];
               const newestFirst = [...apiMessages].reverse();
-              setMessages(newestFirst);
+              setMessagesInStore(conversationId, newestFirst);
             } catch {
               // ignore; optimistic bubble stays
             }
@@ -765,8 +957,10 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
 
                           // Optimistic local toggle: one reaction per user per message,
                           // tap again on same emoji removes it, tap different emoji switches.
-                          setMessages((prev) =>
-                            prev.map((m) => {
+                          const currentMsgs = useChatStore.getState().messages[conversationId] ?? [];
+                          setMessagesInStore(
+                            conversationId,
+                            currentMsgs.map((m) => {
                               const key = m.whatsappMessageId ?? m.id;
                               if (key !== targetKey) return m;
                               const existing = m.reactions ?? [];
@@ -827,6 +1021,118 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                     </TouchableOpacity>
                   ))}
                 </View>
+
+                <View style={styles.messageActionsRow}>
+                  <TouchableOpacity
+                    style={styles.messageActionBtn}
+                    onPress={() => {
+                      if (!reactionTarget) return;
+                      setReplyTarget(reactionTarget);
+                      setReactionTarget(null);
+                    }}
+                    disabled={reactionSending}
+                  >
+                    <Ionicons name="return-up-back-outline" size={18} color={colors.text} />
+                    <Text style={styles.messageActionText}>Reply</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.messageActionBtn}
+                    onPress={() => {
+                      if (!reactionTarget) return;
+                      setForwardTarget(reactionTarget);
+                      setForwardError(null);
+                      setForwardQuery('');
+                      setReactionTarget(null);
+                    }}
+                    disabled={reactionSending}
+                  >
+                    <Ionicons name="arrow-redo-outline" size={18} color={colors.text} />
+                    <Text style={styles.messageActionText}>Forward</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
+      <Modal
+        visible={!!forwardTarget}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setForwardTarget(null)}
+      >
+        <TouchableWithoutFeedback onPress={() => setForwardTarget(null)}>
+          <View style={styles.forwardOverlay}>
+            <TouchableWithoutFeedback>
+              <View style={styles.forwardSheet}>
+                <View style={styles.forwardHeader}>
+                  <Text style={styles.forwardTitle}>Forward to…</Text>
+                  <TouchableOpacity
+                    onPress={() => setForwardTarget(null)}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  >
+                    <Ionicons name="close" size={22} color={colors.textMuted} />
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.forwardSearchWrapInput}>
+                  <Ionicons name="search" size={16} color={colors.textMuted} />
+                  <TextInput
+                    value={forwardQuery}
+                    onChangeText={setForwardQuery}
+                    placeholder="Search chats"
+                    placeholderTextColor={colors.textMuted}
+                    style={styles.forwardSearchTextInput}
+                    autoCorrect={false}
+                  />
+                </View>
+
+                {forwardError && <Text style={styles.forwardError}>{forwardError}</Text>}
+
+                <FlatList
+                  data={forwardCandidates}
+                  keyExtractor={(c) => c.id}
+                  keyboardShouldPersistTaps="handled"
+                  renderItem={({ item }) => (
+                    <TouchableOpacity
+                      style={styles.forwardRow}
+                      activeOpacity={0.8}
+                      disabled={forwardSending}
+                      onPress={() => handleForwardTo(item)}
+                    >
+                      <View style={styles.forwardAvatar}>
+                        <Text style={styles.forwardAvatarText}>
+                          {getInitials(item.name || item.phone || 'Chat')}
+                        </Text>
+                      </View>
+                      <View style={styles.forwardRowText}>
+                        <Text style={styles.forwardRowTitle} numberOfLines={1}>
+                          {item.name || item.phone || 'Chat'}
+                        </Text>
+                        {!!item.phone && (
+                          <Text style={styles.forwardRowSubtitle} numberOfLines={1}>
+                            {item.phone}
+                          </Text>
+                        )}
+                      </View>
+                      <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
+                    </TouchableOpacity>
+                  )}
+                  ListEmptyComponent={
+                    <View style={styles.forwardEmpty}>
+                      <Text style={styles.forwardEmptyText}>No chats found</Text>
+                    </View>
+                  }
+                />
+
+                {forwardSending && (
+                  <View style={styles.forwardSendingRow}>
+                    <ActivityIndicator size="small" color={colors.primary} />
+                    <Text style={styles.forwardSendingText}>Forwarding…</Text>
+                  </View>
+                )}
               </View>
             </TouchableWithoutFeedback>
           </View>
@@ -1250,6 +1556,133 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     minWidth: 220,
     alignItems: 'center',
+  },
+  messageActionsRow: {
+    marginTop: 10,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  messageActionBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: colors.backgroundSecondary,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    gap: 8,
+  },
+  messageActionText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  forwardOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    justifyContent: 'flex-end',
+  },
+  forwardSheet: {
+    backgroundColor: colors.background,
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    paddingBottom: 14,
+    maxHeight: '78%',
+  },
+  forwardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 4,
+    paddingBottom: 10,
+  },
+  forwardTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: colors.text,
+  },
+  forwardSearchWrapInput: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    marginBottom: 10,
+  },
+  forwardSearchTextInput: {
+    flex: 1,
+    color: colors.text,
+    fontSize: 15,
+    paddingVertical: 0,
+  },
+  forwardError: {
+    fontSize: 13,
+    color: colors.error,
+    marginBottom: 8,
+    paddingHorizontal: 4,
+  },
+  forwardRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+    gap: 10,
+  },
+  forwardAvatar: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: colors.backgroundSecondary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  forwardAvatarText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: colors.textSecondary,
+  },
+  forwardRowText: {
+    flex: 1,
+  },
+  forwardRowTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  forwardRowSubtitle: {
+    fontSize: 12,
+    color: colors.textMuted,
+    marginTop: 2,
+  },
+  forwardEmpty: {
+    paddingVertical: 18,
+    alignItems: 'center',
+  },
+  forwardEmptyText: {
+    color: colors.textMuted,
+    fontSize: 13,
+  },
+  forwardSendingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingTop: 10,
+  },
+  forwardSendingText: {
+    fontSize: 13,
+    color: colors.textMuted,
   },
   reactionTitle: {
     fontSize: 13,

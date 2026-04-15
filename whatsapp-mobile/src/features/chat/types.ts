@@ -43,16 +43,34 @@ export interface Conversation {
    */
   templateOnly?: boolean;
   /**
+   * Unix ms timestamp at which the 24-hour messaging window closes
+   * (= lastIncomingMessageTime + 24 h). Present only when a customer
+   * message has been received. Used to show a live countdown.
+   */
+  windowExpiresAt?: number;
+  /**
    * True for the "You" / self-chat conversation.
    * Self-chats are personal notes — they NEVER use template-only mode.
    */
   isSelf?: boolean;
 }
 
+/** Shape returned by GET /api/whatsapp/phone-configs */
+export interface PhoneConfig {
+  phoneNumberId: string;
+  displayNumber?: string;
+  displayName?: string;
+  area: string | string[];
+  businessAccountId?: string;
+  isInternal?: boolean;
+}
+
 export interface ChatState {
   conversations: Conversation[];
   activeConversationId: string | null;
   messages: Record<string, Message[]>;
+  /** Phone configs fetched from the backend (Meta-validated). Null = not yet loaded. */
+  phoneConfigs: PhoneConfig[] | null;
   isLoading: boolean;
   error: string | null;
 }

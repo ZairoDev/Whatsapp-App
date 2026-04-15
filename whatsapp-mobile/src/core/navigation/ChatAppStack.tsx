@@ -6,6 +6,7 @@ import { ConversationDetailScreen } from '../../features/chat/screens/Conversati
 import { ArchivedConversationsScreen } from '../../features/chat/screens/ArchivedConversationsScreen';
 import { VideoPlayerScreen } from '../../features/chat/screens/VideoPlayerScreen';
 import type { RootStackParamList } from './RootNavigator';
+import { useWhatsAppRealtime } from '../../features/chat/hooks';
 
 export type ChatAppStackParamList = {
   ConversationList: { initialArea?: 'athens' | 'thessaloniki' } | undefined;
@@ -14,12 +15,16 @@ export type ChatAppStackParamList = {
     area: 'athens' | 'thessaloniki';
     conversationName?: string;
     participantPhone?: string;
+    /** When true, this is a "draft" chat started by entering a phone number. */
+    isDraft?: boolean;
     highlightMessageId?: string;
     highlightTimestamp?: number;
     /** Backend-provided flag: 24-hour window expired → only templates allowed */
     templateOnly?: boolean;
     /** True for the "You" self-chat — always sends directly, never template-only */
     isSelf?: boolean;
+    /** Unix ms timestamp when the 24-hour messaging window closes. Used for live countdown. */
+    windowExpiresAt?: number;
   };
   ArchiveList: undefined;
   VideoPlayer: {
@@ -40,6 +45,7 @@ const Stack = createNativeStackNavigator<ChatAppStackParamList>();
 export function ChatAppStack() {
   const route = useRoute<RouteProp<RootStackParamList, 'ChatApp'>>();
   const initialArea = route.params?.initialArea;
+  useWhatsAppRealtime();
 
   return (
     <Stack.Navigator screenOptions={{ headerShown: false }}>

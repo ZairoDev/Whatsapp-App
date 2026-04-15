@@ -3,24 +3,106 @@
  * Backend: GET /api/whatsapp/conversations returns { success, conversations, archivedCount, pagination } and requires Bearer token.
  */
 import api from '../../../services/api';
-import type { Message, Conversation } from '../types';
+import type { Message, Conversation, PhoneConfig } from '../types';
 
 export type WhatsAppArea = 'athens' | 'thessaloniki';
 
-/** Phone ID from env: use EXPO_PUBLIC_WHATSAPP_ATHENS_PHONE_ID / EXPO_PUBLIC_WHATSAPP_THESSALONIKI_PHONE_ID in .env for Expo. */
-function getPhoneIdForArea(area: WhatsAppArea): string {
-  if (area === 'athens') {
-    return (
-      (typeof process !== 'undefined' && process.env?.EXPO_PUBLIC_WHATSAPP_ATHENS_PHONE_ID) ||
-      (typeof process !== 'undefined' && (process.env as Record<string, string>)?.WHATSAPP_ATHENS_PHONE_ID) ||
-      ''
+let phoneConfigsInFlight: Promise<PhoneConfig[]> | null = null;
+
+// ---------------------------------------------------------------------------
+// Phone config resolution
+// The mobile must use the same phone IDs as the website. The website resolves
+// them by calling GET /api/whatsapp/phone-configs which validates against Meta.
+// Hardcoding them in .env is unreliable — Meta is the source of truth.
+// ---------------------------------------------------------------------------
+
+interface PhoneConfigsApiResponse {
+  success?: boolean;
+  phoneConfigs?: Record<string, unknown>[];
+  data?: { phoneConfigs?: Record<string, unknown>[] };
+}
+
+/** Fetch Meta-validated phone configs from the backend (same call the website makes). */
+export async function fetchPhoneConfigs(): Promise<PhoneConfig[]> {
+  const { data } = await api.get<PhoneConfigsApiResponse>('/whatsapp/phone-configs');
+  // Some deployments wrap payload under `data`.
+  const raw = (data?.phoneConfigs ?? data?.data?.phoneConfigs) as Record<string, unknown>[] | undefined;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((c) => ({
+      phoneNumberId: String((c as any).phoneNumberId ?? (c as any).phone_number_id ?? ''),
+    displayNumber: c.displayNumber as string | undefined,
+    displayName: c.displayName as string | undefined,
+    // Area can be string, string[], or comma-separated string.
+    area: (c.area ?? (c as any).areas ?? '') as string | string[],
+    businessAccountId: c.businessAccountId as string | undefined,
+    isInternal: Boolean(c.isInternal),
+  }))
+    .filter((c) => c.phoneNumberId);
+}
+
+/** Resolve the correct phoneId for an area from backend-validated phone configs. */
+export function getPhoneIdForArea(area: WhatsAppArea, configs: PhoneConfig[]): string {
+  const wanted = area.toLowerCase().trim();
+  const normalizeAreas = (rawArea: PhoneConfig['area']): string[] => {
+    const arr = Array.isArray(rawArea) ? rawArea : [rawArea];
+    return arr
+      .flatMap((a) => String(a ?? '').split(','))
+      .map((s) => s.toLowerCase().trim())
+      .filter(Boolean);
+  };
+
+  const matches = configs.filter((c) => normalizeAreas(c.area).includes(wanted));
+  // Prefer non-internal configs, but fall back to internal if that's all we have.
+  const preferred = matches.find((c) => !c.isInternal) ?? matches[0];
+  return preferred?.phoneNumberId ?? '';
+}
+
+async function ensurePhoneId(area: WhatsAppArea, phoneId?: string): Promise<string> {
+  if (phoneId) return phoneId;
+
+  // Try the in-memory store first (populated by ConversationListScreen).
+  try {
+    const { useChatStore } = require('../chat.store');
+    const existing = (useChatStore.getState().phoneConfigs ?? null) as PhoneConfig[] | null;
+    if (existing && existing.length) {
+      const resolved = getPhoneIdForArea(area, existing);
+      if (resolved) return resolved;
+    }
+  } catch {
+    // non-blocking
+  }
+
+  // If missing, fetch once (deduped) and store for the rest of the session.
+  if (!phoneConfigsInFlight) {
+    phoneConfigsInFlight = fetchPhoneConfigs().finally(() => {
+      phoneConfigsInFlight = null;
+    });
+  }
+  const configs = await phoneConfigsInFlight;
+  try {
+    const { useChatStore } = require('../chat.store');
+    useChatStore.getState().setPhoneConfigs(configs);
+  } catch {
+    // non-blocking
+  }
+  const resolved = getPhoneIdForArea(area, configs);
+  if (!resolved) {
+    const availableAreas = Array.from(
+      new Set(
+        (configs ?? [])
+          .flatMap((c) => (Array.isArray(c.area) ? c.area : [c.area]))
+          .flatMap((a) => String(a ?? '').split(','))
+          .map((s) => s.trim())
+          .filter(Boolean)
+      )
+    );
+    const internalCount = (configs ?? []).filter((c) => c.isInternal).length;
+    throw new Error(
+      `No phone config found for area "${area}". Backend returned ${configs.length} phone configs (internal: ${internalCount}). Areas seen: ${availableAreas.length ? availableAreas.join(', ') : '(none)'}.`
     );
   }
-  return (
-    (typeof process !== 'undefined' && process.env?.EXPO_PUBLIC_WHATSAPP_THESSALONIKI_PHONE_ID) ||
-    (typeof process !== 'undefined' && (process.env as Record<string, string>)?.WHATSAPP_THESSALONIKI_PHONE_ID) ||
-    ''
-  );
+  return resolved;
 }
 
 /** Map backend conversation doc to app Conversation type */
@@ -62,7 +144,25 @@ function mapApiConversation(c: Record<string, unknown>): Conversation {
         false
       );
 
-  return { id, name, lastMessage, lastMessageAt, unreadCount, avatar, phone, isSelf, templateOnly };
+  // Compute when the 24-hour messaging window closes.
+  // The backend stores `lastIncomingMessageTime` (last customer message).
+  // windowExpiresAt = lastIncomingMessageTime + 24 h (in ms).
+  const rawIncoming =
+    (c.lastIncomingMessageTime ?? c.lastCustomerMessageAt) as string | Date | number | undefined;
+  let windowExpiresAt: number | undefined;
+  if (rawIncoming) {
+    const incomingMs =
+      typeof rawIncoming === 'number'
+        ? rawIncoming
+        : rawIncoming instanceof Date
+          ? rawIncoming.getTime()
+          : new Date(rawIncoming).getTime();
+    if (!isNaN(incomingMs)) {
+      windowExpiresAt = incomingMs + 24 * 60 * 60 * 1000;
+    }
+  }
+
+  return { id, name, lastMessage, lastMessageAt, unreadCount, avatar, phone, isSelf, templateOnly, windowExpiresAt };
 }
 
 /** Response shape from GET /api/whatsapp/conversations */
@@ -90,14 +190,11 @@ const CONVERSATIONS_PAGE_SIZE = 25;
 
 export async function fetchConversations(
   area: WhatsAppArea,
-  cursor?: string | null
+  cursor?: string | null,
+  /** Pass the phoneId resolved from fetchPhoneConfigs() — never read from .env */
+  phoneId?: string
 ): Promise<FetchConversationsResult> {
-  const phoneId = getPhoneIdForArea(area);
-  if (!phoneId) {
-    throw new Error(
-      `Missing phone ID for area: ${area}. Set EXPO_PUBLIC_WHATSAPP_ATHENS_PHONE_ID / EXPO_PUBLIC_WHATSAPP_THESSALONIKI_PHONE_ID in .env`
-    );
-  }
+  phoneId = await ensurePhoneId(area, phoneId);
   const params: Record<string, string | number> = { limit: CONVERSATIONS_PAGE_SIZE, phoneId };
   if (cursor) {
     params.cursor = cursor;
@@ -257,12 +354,11 @@ export async function fetchConversationMessages(
   area: WhatsAppArea,
   limit: number = MESSAGES_PAGE_SIZE,
   beforeMessageId?: string | null,
-  beforeTimestamp?: string | null
+  beforeTimestamp?: string | null,
+  /** Pass the phoneId resolved from fetchPhoneConfigs() — never read from .env */
+  phoneId?: string
 ): Promise<FetchMessagesResult> {
-  const phoneId = getPhoneIdForArea(area);
-  if (!phoneId) {
-    throw new Error(`Missing phone ID for area: ${area}`);
-  }
+  phoneId = await ensurePhoneId(area, phoneId);
   const params: Record<string, string | number> = {
     limit,
     phoneId,
@@ -323,14 +419,22 @@ export async function sendMessage(
   conversationId: string,
   to: string,
   content: string,
-  type: Message['type'] = 'text'
+  type: Message['type'] = 'text',
+  area?: WhatsAppArea,
+  /** Pass the phoneId resolved from fetchPhoneConfigs() — optional */
+  phoneId?: string
 ): Promise<void> {
   if (!conversationId || !content.trim()) return;
+  if (area) {
+    phoneId = await ensurePhoneId(area, phoneId);
+  }
   await api.post('/whatsapp/send-message', {
     to,
     message: content,
     conversationId,
     type,
+    // Backend reads "phoneNumberId" (not "phoneId") to pick the correct number
+    ...(phoneId ? { phoneNumberId: phoneId } : {}),
   });
 }
 
@@ -526,19 +630,37 @@ export interface SendTemplateParams {
   conversationId?: string;
   /** Filled template text for display in DB */
   templateText?: string;
+  /** Area to resolve correct WhatsApp phoneNumberId (Athens vs Thessaloniki) */
+  area?: WhatsAppArea;
+  /** Optional phoneNumberId override (if already resolved) */
+  phoneNumberId?: string;
+}
+
+function isMongoObjectId(id: string | undefined | null): boolean {
+  if (!id) return false;
+  // Strict 24-hex format. Draft IDs like "draft:918..." must not be sent as conversationId.
+  return /^[a-fA-F0-9]{24}$/.test(id);
 }
 
 export async function sendTemplate(params: SendTemplateParams): Promise<{ success?: boolean; messageId?: string }> {
-  const { to, template, parameters, conversationId, templateText } = params;
+  const { to, template, parameters, conversationId, templateText, area, phoneNumberId: phoneNumberIdParam } = params;
   const languageCode = template.language ?? 'en';
   const components = buildTemplateComponents(template, parameters);
+  let phoneId = phoneNumberIdParam;
+  if (area) {
+    phoneId = await ensurePhoneId(area, phoneNumberIdParam);
+  }
   const body: Record<string, unknown> = {
     templateName: template.name,
     languageCode,
     components,
-    conversationId,
     templateText,
+    // Backend reads "phoneNumberId" (not "phoneId") to pick the correct number
+    ...(phoneId ? { phoneNumberId: phoneId } : {}),
   };
+  if (isMongoObjectId(conversationId)) {
+    body.conversationId = conversationId;
+  }
   if (to?.trim()) {
     body.to = to.replace(/\D/g, '');
   }
@@ -565,12 +687,7 @@ export async function searchConversations(
   area: WhatsAppArea,
   query: string
 ): Promise<ConversationSearchResult[]> {
-  const phoneId = getPhoneIdForArea(area);
-  if (!phoneId) {
-    throw new Error(
-      `Missing phone ID for area: ${area}. Set EXPO_PUBLIC_WHATSAPP_ATHENS_PHONE_ID / EXPO_PUBLIC_WHATSAPP_THESSALONIKI_PHONE_ID in .env`
-    );
-  }
+  const phoneId = await ensurePhoneId(area);
 
   const params = {
     query,

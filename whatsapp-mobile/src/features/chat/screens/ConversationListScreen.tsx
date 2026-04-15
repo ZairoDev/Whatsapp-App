@@ -2,21 +2,30 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   FlatList,
+  Modal,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import { useChatStore } from '../chat.store'; 
-import { fetchConversations, searchConversations } from '../services';
+import { useChatStore } from '../chat.store';
+import {
+  fetchConversations,
+  fetchPhoneConfigs,
+  getPhoneIdForArea,
+  searchConversations,
+} from '../services';
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+  import { useFocusEffect } from '@react-navigation/native';
 import { colors } from '../../../theme/colors';
 import type { Conversation } from '../types';
 import type { ConversationSearchResult } from '../services';
+import { joinWhatsAppPhone, leaveWhatsAppPhone } from '../../../services/socket';
 
 type Props = NativeStackScreenProps<ChatAppStackParamList, 'ConversationList'>;
 
@@ -48,7 +57,7 @@ function escapeRegExp(str: string): string {
 }
 
 export function ConversationListScreen({ route, navigation }: Props) {
-  const { conversations, setConversations, appendConversations } = useChatStore();
+  const { conversations, setConversations, appendConversations, phoneConfigs, setPhoneConfigs } = useChatStore();
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -60,45 +69,83 @@ export function ConversationListScreen({ route, navigation }: Props) {
   const [searchError, setSearchError] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<FilterTab>('All');
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const loadedAreaRef = useRef<string | null>(null);
+  const [showNewChatModal, setShowNewChatModal] = useState(false);
+  const [countryCode, setCountryCode] = useState('+30');
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [newChatError, setNewChatError] = useState<string | null>(null);
+  /** Tracks which area the in-memory list was last loaded for (not persisted). */
+  const lastFetchedAreaRef = useRef<string | null>(null);
   const onEndReachedCalled = useRef(false);
 
   const initialArea = route.params?.initialArea ?? 'athens';
   const area = initialArea as 'athens' | 'thessaloniki';
 
+  // Join the phone-specific Socket.IO room for the selected area so incoming messages stream in real-time.
   useEffect(() => {
-    if (loadedAreaRef.current === area && conversations.length > 0) {
-      return;
-    }
-    loadedAreaRef.current = area;
-    let cancelled = false;
-    (async () => {
-      try {
-        setLoading(true);
-        setError(null);
-        setNextCursor(null);
-        setHasMore(false);
-        const result = await fetchConversations(area);
-        if (!cancelled) {
-          setConversations(result.conversations);
-          setNextCursor(result.nextCursor);
-          setHasMore(result.hasMore);
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : 'Failed to load conversations');
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      }
-    })();
-
+    const configs = useChatStore.getState().phoneConfigs ?? [];
+    const phoneId = getPhoneIdForArea(area, configs);
+    if (phoneId) joinWhatsAppPhone(phoneId);
     return () => {
-      cancelled = true;
+      if (phoneId) leaveWhatsAppPhone(phoneId);
     };
-  }, [area, setConversations]);
+  }, [area]);
+
+  // Refetch whenever this screen is focused. The old useEffect skipped loading when the
+  // Zustand store already had rows for this area — but React Navigation often keeps this
+  // screen mounted under the detail screen, so returning from a chat never re-ran the
+  // effect and the list stayed stale vs the website (fresh GET each visit).
+  //
+  // We also call /api/whatsapp/phone-configs first (exactly like the website) so the
+  // phoneId is always resolved from Meta — not from hardcoded .env values which were
+  // pointing to the wrong phone number for Thessaloniki.
+  useFocusEffect(
+    useCallback(() => {
+      const areaChanged = lastFetchedAreaRef.current !== area;
+      lastFetchedAreaRef.current = area;
+      const hadList = useChatStore.getState().conversations.length > 0;
+      const showFullScreenLoader = !hadList || areaChanged;
+
+      let cancelled = false;
+      (async () => {
+        try {
+          if (showFullScreenLoader) {
+            setLoading(true);
+          }
+          setError(null);
+          setNextCursor(null);
+          setHasMore(false);
+
+          // Resolve phone configs from backend (Meta-validated) on first load or if missing.
+          // This is the same call the website makes before fetching conversations.
+          let configs = useChatStore.getState().phoneConfigs;
+          if (!configs) {
+            configs = await fetchPhoneConfigs();
+            if (!cancelled) setPhoneConfigs(configs);
+          }
+
+          const phoneId = getPhoneIdForArea(area, configs);
+          const result = await fetchConversations(area, null, phoneId);
+          if (!cancelled) {
+            setConversations(result.conversations);
+            setNextCursor(result.nextCursor);
+            setHasMore(result.hasMore);
+          }
+        } catch (e) {
+          if (!cancelled && showFullScreenLoader) {
+            setError(e instanceof Error ? e.message : 'Failed to load conversations');
+          }
+        } finally {
+          if (!cancelled && showFullScreenLoader) {
+            setLoading(false);
+          }
+        }
+      })();
+
+      return () => {
+        cancelled = true;
+      };
+    }, [area, setConversations, setPhoneConfigs])
+  );
 
   const loadMore = useCallback(async () => {
     if (loadingMore || !hasMore || !nextCursor) return;
@@ -106,7 +153,9 @@ export function ConversationListScreen({ route, navigation }: Props) {
     onEndReachedCalled.current = true;
     try {
       setLoadingMore(true);
-      const result = await fetchConversations(area, nextCursor);
+      const configs = useChatStore.getState().phoneConfigs ?? [];
+      const phoneId = getPhoneIdForArea(area, configs);
+      const result = await fetchConversations(area, nextCursor, phoneId);
       appendConversations(result.conversations);
       setNextCursor(result.nextCursor);
       setHasMore(result.hasMore);
@@ -175,6 +224,36 @@ export function ConversationListScreen({ route, navigation }: Props) {
   const archivedCount = 0; // Placeholder; could come from API later
 
   const isSelectionMode = selectedIds.length > 0;
+
+  const openNewChat = useCallback(() => {
+    setNewChatError(null);
+    setPhoneNumber('');
+    setShowNewChatModal(true);
+  }, []);
+
+  const startChatWithNumber = useCallback(() => {
+    const ccDigits = countryCode.replace(/[^\d]/g, '');
+    const phoneDigits = phoneNumber.replace(/[^\d]/g, '');
+    if (!ccDigits) {
+      setNewChatError('Please enter a country code');
+      return;
+    }
+    if (!phoneDigits) {
+      setNewChatError('Please enter a phone number');
+      return;
+    }
+    const to = `${ccDigits}${phoneDigits}`;
+    setShowNewChatModal(false);
+    setNewChatError(null);
+    navigation.navigate('ConversationDetail', {
+      conversationId: `draft:${to}`,
+      area,
+      conversationName: `+${to}`,
+      participantPhone: to,
+      templateOnly: true,
+      isDraft: true,
+    });
+  }, [countryCode, phoneNumber, navigation, area]);
 
   const clearSelection = useCallback(() => {
     setSelectedIds([]);
@@ -253,6 +332,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
               participantPhone: item.phone,
               isSelf: item.isSelf,
               templateOnly: item.templateOnly,
+              windowExpiresAt: item.windowExpiresAt,
             });
           }
         }}
@@ -317,8 +397,8 @@ export function ConversationListScreen({ route, navigation }: Props) {
       <View style={styles.titleRow}>
         <Text style={styles.title}>WhatsApp</Text>
         <View style={styles.titleIcons}>
-          <TouchableOpacity style={styles.iconBtn} hitSlop={8}>
-            <Ionicons name="cellular-outline" size={22} color={colors.primary} />
+          <TouchableOpacity style={styles.iconBtn} hitSlop={8} onPress={openNewChat}>
+            <Ionicons name="person-add-outline" size={22} color={colors.primary} />
           </TouchableOpacity>
           <TouchableOpacity style={styles.iconBtn} hitSlop={8}>
             <Ionicons name="create-outline" size={22} color={colors.textMuted} />
@@ -375,6 +455,67 @@ export function ConversationListScreen({ route, navigation }: Props) {
 
   return (
     <View style={styles.container}>
+      <Modal
+        visible={showNewChatModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowNewChatModal(false)}
+      >
+        <TouchableWithoutFeedback onPress={() => setShowNewChatModal(false)}>
+          <View style={styles.modalOverlay}>
+            <TouchableWithoutFeedback>
+              <View style={styles.modalCard}>
+                <Text style={styles.modalTitle}>Start a new chat</Text>
+                <Text style={styles.modalSubtitle}>Enter country code and phone number</Text>
+
+                <View style={styles.modalRow}>
+                  <View style={styles.modalFieldSmall}>
+                    <Text style={styles.modalLabel}>Country</Text>
+                    <TextInput
+                      style={styles.modalInput}
+                      value={countryCode}
+                      onChangeText={(v) => setCountryCode(v.startsWith('+') ? v : `+${v}`)}
+                      placeholder="+1"
+                      placeholderTextColor={colors.textMuted}
+                      keyboardType="phone-pad"
+                      autoCorrect={false}
+                      autoCapitalize="none"
+                    />
+                  </View>
+                  <View style={styles.modalField}>
+                    <Text style={styles.modalLabel}>Phone</Text>
+                    <TextInput
+                      style={styles.modalInput}
+                      value={phoneNumber}
+                      onChangeText={setPhoneNumber}
+                      placeholder="Phone number"
+                      placeholderTextColor={colors.textMuted}
+                      keyboardType="phone-pad"
+                      autoCorrect={false}
+                      autoCapitalize="none"
+                    />
+                  </View>
+                </View>
+
+                {newChatError && <Text style={styles.modalError}>{newChatError}</Text>}
+
+                <View style={styles.modalActions}>
+                  <TouchableOpacity
+                    style={[styles.modalBtn, styles.modalBtnSecondary]}
+                    onPress={() => setShowNewChatModal(false)}
+                  >
+                    <Text style={styles.modalBtnSecondaryText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.modalBtn, styles.modalBtnPrimary]} onPress={startChatWithNumber}>
+                    <Text style={styles.modalBtnPrimaryText}>Continue</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
       <SafeAreaView edges={['top']} style={styles.selectionSafeArea}>
         {isSelectionMode && (
           <View style={styles.selectionBar}>
@@ -452,6 +593,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
                                 highlightMessageId: item.messageId,
                                 highlightTimestamp: item.messageTimestamp,
                                 templateOnly: (item as Conversation).templateOnly,
+                                windowExpiresAt: (item as Conversation).windowExpiresAt,
                               });
                             }}
                           >
@@ -777,5 +919,80 @@ const styles = StyleSheet.create({
   footerLoader: {
     paddingVertical: 16,
     alignItems: 'center',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    paddingHorizontal: 16,
+    justifyContent: 'center',
+  },
+  modalCard: {
+    backgroundColor: colors.background,
+    borderRadius: 16,
+    padding: 16,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  modalSubtitle: {
+    marginTop: 4,
+    fontSize: 14,
+    color: colors.textSecondary,
+  },
+  modalRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 14,
+  },
+  modalFieldSmall: {
+    width: 110,
+  },
+  modalField: {
+    flex: 1,
+  },
+  modalLabel: {
+    fontSize: 12,
+    color: colors.textMuted,
+    marginBottom: 6,
+  },
+  modalInput: {
+    backgroundColor: colors.backgroundSecondary,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
+    color: colors.text,
+  },
+  modalError: {
+    marginTop: 10,
+    color: colors.error,
+    fontSize: 13,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 16,
+  },
+  modalBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  modalBtnSecondary: {
+    backgroundColor: colors.backgroundSecondary,
+  },
+  modalBtnPrimary: {
+    backgroundColor: HEADER_GREEN,
+  },
+  modalBtnSecondaryText: {
+    color: colors.text,
+    fontWeight: '600',
+  },
+  modalBtnPrimaryText: {
+    color: '#fff',
+    fontWeight: '700',
   },
 });

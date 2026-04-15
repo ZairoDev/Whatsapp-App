@@ -39,6 +39,7 @@ function MediaSlide({ item }: { item: MediaGalleryItem }) {
           usePoster={!!thumbnailUri}
         />
       ) : (
+        
         <View style={slideStyles.imageWrap}>
           <Image
             source={{ uri: mediaUri }}

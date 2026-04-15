@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -23,12 +23,39 @@ import {
 import type { WhatsAppTemplate } from '../services';
 import { colors } from '../../../theme/colors';
 
+/** Format milliseconds remaining into "Xh Ym" or "Ym Zs" */
+function formatCountdown(ms: number): string {
+  if (ms <= 0) return '0m';
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 interface MessageComposerProps {
-  conversationId: string;
+  conversationId?: string;
   /** Participant phone (E.164) for sending templates - required when templateOnly */
   participantPhone?: string;
+  /** Current area (athens/thessaloniki) so backend sends from correct number */
+  area?: 'athens' | 'thessaloniki';
+  /** Optional reply target (UI + quoted prefix since backend doesn't support reply metadata yet). */
+  replyTo?: {
+    id: string;
+    preview: string;
+  } | null;
+  onCancelReply?: () => void;
   /** When false: normal WhatsApp input. When true: template-only (24h window closed) */
   templateOnly?: boolean;
+  /**
+   * Unix ms timestamp when the 24-hour messaging window closes.
+   * Derived from last customer message + 24h. Absent = conversation not started yet.
+   */
+  windowExpiresAt?: number;
+  /** Self / "You" chat — always free-text, no window bar */
+  isSelf?: boolean;
   onMessageSent?: () => void;
   /**
    * Called immediately when user hits send so the parent can show an optimistic
@@ -45,13 +72,39 @@ interface MessageComposerProps {
 export function MessageComposer({
   conversationId,
   participantPhone,
+  area,
+  replyTo = null,
+  onCancelReply,
   templateOnly = false,
+  windowExpiresAt,
+  isSelf = false,
   onMessageSent,
   onOptimisticAdd,
   onOptimisticSetStatus,
 }: MessageComposerProps) {
   const insets = useSafeAreaInsets();
   const [text, setText] = useState('');
+
+  // Live countdown whenever we know window end (conversation has started).
+  const [remainingMs, setRemainingMs] = useState<number>(() =>
+    windowExpiresAt ? Math.max(0, windowExpiresAt - Date.now()) : 0
+  );
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (!windowExpiresAt) {
+      setRemainingMs(0);
+      return;
+    }
+    const tick = () => {
+      setRemainingMs(Math.max(0, windowExpiresAt - Date.now()));
+    };
+    tick();
+    timerRef.current = setInterval(tick, 1000);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [windowExpiresAt]);
   const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
   const [templatesLoading, setTemplatesLoading] = useState(false);
   const [templatesError, setTemplatesError] = useState<string | null>(null);
@@ -93,7 +146,10 @@ export function MessageComposer({
   }, []);
 
   const handleSendTemplate = useCallback(async () => {
-    if (!selectedTemplate || !conversationId) return;
+    if (!selectedTemplate) return;
+    // For new/draft chats we may not have a conversationId yet. Backend can start the chat from `to`.
+    if (!conversationId && !participantPhone?.trim()) return;
+    const isRealConversationId = (id?: string) => Boolean(id && /^[a-fA-F0-9]{24}$/.test(id));
     // Backend resolves recipient from conversationId when `to` is not sent
     const vars = getTemplateVariables(selectedTemplate);
     const hasEmpty = vars.some((_, i) => !(templateFieldValues[i]?.trim()));
@@ -103,40 +159,66 @@ export function MessageComposer({
     }
     setSending(true);
     setSendError(null);
+    // Optimistic bubble so templates appear instantly in the thread (especially for drafts).
+    let optimisticId: string | undefined;
     try {
       const preview = getTemplatePreview(selectedTemplate, templateFieldValues);
       const templateText = [preview.header, preview.body, preview.footer].filter(Boolean).join('\n');
+      if (templateText.trim()) {
+        optimisticId = onOptimisticAdd?.(templateText.trim());
+      } else {
+        optimisticId = onOptimisticAdd?.(`[Template] ${selectedTemplate.name}`);
+      }
       await sendTemplate({
         ...(participantPhone?.trim() && { to: participantPhone }),
+        ...(area ? { area } : {}),
         template: selectedTemplate,
         parameters: templateFieldValues.map((v) => v.trim()),
-        conversationId,
+        ...(isRealConversationId(conversationId) ? { conversationId } : {}),
         templateText,
       });
+      if (optimisticId) onOptimisticSetStatus?.(optimisticId, 'sent');
       setShowTemplateModal(false);
       setSelectedTemplate(null);
       setTemplateFieldValues([]);
       onMessageSent?.();
     } catch (e) {
+      if (optimisticId) onOptimisticSetStatus?.(optimisticId, 'failed');
       setSendError(e instanceof Error ? e.message : 'Failed to send template');
     } finally {
       setSending(false);
     }
-  }, [selectedTemplate, conversationId, participantPhone, templateFieldValues, onMessageSent]);
+  }, [
+    selectedTemplate,
+    conversationId,
+    participantPhone,
+    area,
+    templateFieldValues,
+    onMessageSent,
+    onOptimisticAdd,
+    onOptimisticSetStatus,
+  ]);
 
   const handleSendText = useCallback(async () => {
     const content = text.trim();
     if (!content || !conversationId) return;
     const to = participantPhone ?? '';
 
+    const replyPrefix =
+      replyTo?.preview?.trim()
+        ? `↩︎ Replying to:\n> ${replyTo.preview.trim().replace(/\n/g, ' ')}\n\n`
+        : '';
+    const outgoing = `${replyPrefix}${content}`;
+
     // Optimistically insert the bubble immediately
-    const tempId = onOptimisticAdd?.(content);
+    const tempId = onOptimisticAdd?.(outgoing);
     setText('');
 
     try {
-      await sendMessage(conversationId, to, content, 'text');
+      await sendMessage(conversationId, to, outgoing, 'text', area);
       if (tempId) onOptimisticSetStatus?.(tempId, 'sent');
       onMessageSent?.();
+      onCancelReply?.();
     } catch {
       // Show the message as failed instead of silently restoring text
       if (tempId) {
@@ -145,25 +227,52 @@ export function MessageComposer({
         setText(content); // fallback: restore if parent doesn't support optimistic
       }
     }
-  }, [text, conversationId, participantPhone, onMessageSent, onOptimisticAdd, onOptimisticSetStatus]);
+  }, [text, conversationId, participantPhone, area, onMessageSent, onOptimisticAdd, onOptimisticSetStatus, replyTo, onCancelReply]);
 
   const variables = selectedTemplate ? getTemplateVariables(selectedTemplate) : [];
   const preview = selectedTemplate
     ? getTemplatePreview(selectedTemplate, templateFieldValues)
     : null;
 
+  const conversationStarted = Boolean(windowExpiresAt);
+  // Free text allowed: self-chat, or customer has messaged and 24h window still open.
+  const canSendFreeText =
+    isSelf ||
+    (conversationStarted && !templateOnly && remainingMs > 0);
+  // Template-only input: no customer thread yet, or window closed (backend or client countdown).
+  const composerTemplateMode = !isSelf && !canSendFreeText;
+
+  const showTemplateInfoBar = !isSelf && composerTemplateMode;
+  const showCountdownInfoBar =
+    !isSelf && conversationStarted && canSendFreeText && remainingMs > 0;
+
+  const countdownColor =
+    remainingMs > 6 * 3600 * 1000
+      ? '#25D366'
+      : remainingMs > 2 * 3600 * 1000
+        ? '#f59e0b'
+        : '#ef4444';
+
   return (
     <>
-      {templateOnly && (
+      {showTemplateInfoBar && (
         <View style={styles.infoBar}>
           <View style={styles.infoBarLeft}>
             <View style={styles.infoIconWrap}>
-              <Ionicons name="lock-closed-outline" size={18} color={colors.textMuted} />
+              <Ionicons
+                name={conversationStarted ? 'lock-closed-outline' : 'chatbubbles-outline'}
+                size={18}
+                color={colors.textMuted}
+              />
             </View>
             <View style={styles.infoTextBlock}>
-              <Text style={styles.infoTitle}>24-hour window closed</Text>
+              <Text style={styles.infoTitle}>
+                {conversationStarted ? '24-hour window closed' : 'Start with a template'}
+              </Text>
               <Text style={styles.infoSubtitle}>
-                You can only send template messages
+                {conversationStarted
+                  ? 'You can only send template messages'
+                  : "This chat hasn't started — send a template so the customer can reply"}
               </Text>
             </View>
           </View>
@@ -174,11 +283,52 @@ export function MessageComposer({
         </View>
       )}
 
+      {showCountdownInfoBar && (
+        <View style={styles.infoBar}>
+          <View style={styles.infoBarLeft}>
+            <View style={styles.infoIconWrap}>
+              <Ionicons name="time-outline" size={18} color={countdownColor} />
+            </View>
+            <View style={styles.infoTextBlock}>
+              <Text style={styles.infoTitle}>Messaging window</Text>
+              <Text style={styles.infoSubtitle}>
+                Free messages close in{' '}
+                <Text style={[styles.countdownValue, { color: countdownColor }]}>
+                  {formatCountdown(remainingMs)}
+                </Text>
+                {' — then only templates'}
+              </Text>
+            </View>
+          </View>
+        </View>
+      )}
+
+      {!!replyTo && !composerTemplateMode && (
+        <View style={styles.replyBar}>
+          <View style={styles.replyBarLeft}>
+            <View style={styles.replyAccent} />
+            <View style={styles.replyTextBlock}>
+              <Text style={styles.replyLabel}>Replying to</Text>
+              <Text style={styles.replyPreview} numberOfLines={1}>
+                {replyTo.preview}
+              </Text>
+            </View>
+          </View>
+          <TouchableOpacity
+            style={styles.replyCloseBtn}
+            onPress={onCancelReply}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          >
+            <Ionicons name="close" size={18} color={colors.textMuted} />
+          </TouchableOpacity>
+        </View>
+      )}
+
       <View style={[styles.inputBar, { paddingBottom: Math.max(8, insets.bottom) }]}>
         <TouchableOpacity style={styles.inputIconBtn}>
           <Ionicons name="add" size={24} color={colors.textMuted} />
         </TouchableOpacity>
-        {templateOnly ? (
+        {composerTemplateMode ? (
           <TouchableOpacity
             style={styles.inputBox}
             onPress={openTemplateModal}
@@ -201,7 +351,7 @@ export function MessageComposer({
             />
           </View>
         )}
-        {!templateOnly && text.trim().length > 0 ? (
+        {!composerTemplateMode && text.trim().length > 0 ? (
           <TouchableOpacity
             style={styles.sendBtn}
             onPress={handleSendText}
@@ -364,6 +514,10 @@ export function MessageComposer({
 }
 
 const styles = StyleSheet.create({
+  countdownValue: {
+    fontWeight: '700',
+    fontSize: 12,
+  },
   infoBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -417,6 +571,46 @@ const styles = StyleSheet.create({
     backgroundColor: colors.backgroundSecondary,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: colors.border,
+  },
+  replyBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 6,
+    backgroundColor: colors.backgroundSecondary,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
+  },
+  replyBarLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    marginRight: 10,
+  },
+  replyAccent: {
+    width: 3,
+    height: 30,
+    borderRadius: 2,
+    backgroundColor: colors.primary,
+    marginRight: 10,
+  },
+  replyTextBlock: {
+    flex: 1,
+  },
+  replyLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  replyPreview: {
+    fontSize: 12,
+    color: colors.textMuted,
+    marginTop: 2,
+  },
+  replyCloseBtn: {
+    padding: 6,
   },
   inputIconBtn: {
     paddingHorizontal: 6,
