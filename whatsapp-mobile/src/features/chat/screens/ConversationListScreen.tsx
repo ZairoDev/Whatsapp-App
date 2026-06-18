@@ -39,7 +39,8 @@ import {
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
-import { colors } from '../../../theme/colors';
+import { useTheme } from '../../../theme/ThemeContext';
+import type { AppColors } from '../../../theme/palettes';
 import type { Conversation } from '../types';
 import type { ConversationSearchResult } from '../services';
 import { joinWhatsAppPhone, leaveWhatsAppPhone, joinWhatsAppChannel, leaveWhatsAppChannel } from '../../../services/socket';
@@ -47,8 +48,8 @@ import { GuestOutboundStatsBadges } from '../components/GuestOutboundStatsBadges
 
 type Props = NativeStackScreenProps<ChatAppStackParamList, 'ConversationList'>;
 
-const HEADER_GREEN = '#075E54';
 const FILTER_TABS = ['All', 'Unread', 'Favourites', 'Labels'] as const;
+
 type FilterTab = (typeof FILTER_TABS)[number];
 
 function getInitials(name: string): string {
@@ -75,6 +76,8 @@ function escapeRegExp(str: string): string {
 }
 
 export function ConversationListScreen({ route, navigation }: Props) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const tokenData = useAuthStore((s) => s.tokenData);
   const { conversations, setConversations, appendConversations, phoneConfigs, setPhoneConfigs, archivedCount, setArchivedCount } = useChatStore();
   const [loading, setLoading] = useState(false);
@@ -1118,16 +1121,17 @@ export function ConversationListScreen({ route, navigation }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(colors: AppColors) {
+  return StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
   },
   selectionSafeArea: {
-    backgroundColor: HEADER_GREEN,
+    backgroundColor: colors.chatHeader,
   },
   header: {
-    backgroundColor: HEADER_GREEN,
+    backgroundColor: colors.chatHeader,
   },
   headerSafe: {
     flexDirection: 'row',
@@ -1305,7 +1309,7 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
   },
   selectionBar: {
-    backgroundColor: HEADER_GREEN,
+    backgroundColor: colors.chatHeader,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -1379,7 +1383,7 @@ const styles = StyleSheet.create({
     width: 20,
     height: 20,
     borderRadius: 10,
-    backgroundColor: HEADER_GREEN,
+    backgroundColor: colors.chatHeader,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1713,7 +1717,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.backgroundSecondary,
   },
   modalBtnPrimary: {
-    backgroundColor: HEADER_GREEN,
+    backgroundColor: colors.chatHeader,
   },
   modalBtnSecondaryText: {
     color: colors.text,
@@ -1723,4 +1727,5 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontWeight: '700',
   },
-});
+  });
+}

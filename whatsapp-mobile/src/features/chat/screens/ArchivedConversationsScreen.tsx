@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -12,7 +12,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
-import { colors } from '../../../theme/colors';
+import { useTheme } from '../../../theme/ThemeContext';
+import type { AppColors } from '../../../theme/palettes';
 import { GuestOutboundStatsBadges } from '../components/GuestOutboundStatsBadges';
 import { useChatStore } from '../chat.store';
 import { fetchArchivedConversations, unarchiveConversation } from '../services';
@@ -41,6 +42,8 @@ function formatListDate(ts?: number): string {
 }
 
 export function ArchivedConversationsScreen({ navigation, route }: Props) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createArchivedStyles(colors), [colors]);
   const { setActiveConversation } = useChatStore();
   const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const [loading, setLoading] = useState(false);
@@ -196,7 +199,8 @@ export function ArchivedConversationsScreen({ navigation, route }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+function createArchivedStyles(colors: AppColors) {
+  return StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
@@ -312,5 +316,6 @@ const styles = StyleSheet.create({
     paddingLeft: 10,
     paddingVertical: 4,
   },
-});
+  });
+}
 

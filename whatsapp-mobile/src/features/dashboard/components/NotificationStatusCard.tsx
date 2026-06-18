@@ -1,9 +1,10 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { View, Text, StyleSheet, Pressable, ActivityIndicator, Platform } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import * as TokenManager from '../../../notifications/TokenManager';
 import api from '../../../services/api';
-import { colors } from '../../../theme/colors';
+import { useTheme } from '../../../theme/ThemeContext';
+import type { AppColors } from '../../../theme/palettes';
 
 type TestState = 'idle' | 'sending' | 'sent' | 'error';
 
@@ -15,6 +16,8 @@ type TestState = 'idle' | 'sending' | 'sent' | 'error';
  * sends a real test notification through the backend (`POST /push/test`).
  */
 export function NotificationStatusCard() {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const [info, setInfo] = useState<TokenManager.PushDebugInfo>(() => TokenManager.getDebugInfo());
   const [busy, setBusy] = useState(false);
   const [testState, setTestState] = useState<TestState>('idle');
@@ -76,7 +79,7 @@ export function NotificationStatusCard() {
     }
   }, []);
 
-  const view = describe(info, busy);
+  const view = describe(info, busy, colors);
 
   return (
     <View style={styles.card}>
@@ -142,7 +145,7 @@ export function NotificationStatusCard() {
   );
 }
 
-function describe(info: TokenManager.PushDebugInfo, busy: boolean) {
+function describe(info: TokenManager.PushDebugInfo, busy: boolean, colors: AppColors) {
   if (busy && info.status == null) {
     return {
       icon: 'circle-o-notch',
@@ -208,7 +211,8 @@ function describe(info: TokenManager.PushDebugInfo, busy: boolean) {
   }
 }
 
-const styles = StyleSheet.create({
+function createStyles(colors: AppColors) {
+  return StyleSheet.create({
   card: {
     width: '100%',
     padding: 14,
@@ -219,7 +223,7 @@ const styles = StyleSheet.create({
     gap: 10,
     ...Platform.select({
       ios: {
-        shadowColor: '#0B141A',
+        shadowColor: colors.shadow,
         shadowOpacity: 0.05,
         shadowRadius: 18,
         shadowOffset: { width: 0, height: 10 },
@@ -291,4 +295,5 @@ const styles = StyleSheet.create({
     lineHeight: 17,
     fontWeight: '600',
   },
-});
+  });
+}

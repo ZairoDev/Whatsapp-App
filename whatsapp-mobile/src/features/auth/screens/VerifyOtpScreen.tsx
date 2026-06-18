@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -14,7 +14,8 @@ import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useAuthStore } from '../auth.store';
 import { verifyOtp, resendOtp, getVerifyOtpErrorMessage } from '../services/auth.api';
 import { toTokenData } from '../types';
-import { colors } from '../../../theme/colors';
+import { useTheme } from '../../../theme/ThemeContext';
+import type { AppColors } from '../../../theme/palettes';
 import type { AuthStackParamList } from '../../../core/navigation/RootNavigator';
 import { CenteredContent } from '../../../core/layout/CenteredContent';
 
@@ -24,6 +25,8 @@ const RESEND_COOLDOWN_SEC = 30;
 type Props = NativeStackScreenProps<AuthStackParamList, 'VerifyOtp'>;
 
 export function VerifyOtpScreen({ route, navigation }: Props) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createOtpStyles(colors), [colors]);
   const { email } = route.params;
   const setToken = useAuthStore((s) => s.setToken);
   const [otp, setOtp] = useState('');
@@ -180,7 +183,8 @@ export function VerifyOtpScreen({ route, navigation }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+function createOtpStyles(colors: AppColors) {
+  return StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
@@ -285,4 +289,5 @@ const styles = StyleSheet.create({
   resendDisabled: {
     opacity: 0.6,
   },
-});
+  });
+}

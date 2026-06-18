@@ -8,7 +8,6 @@ import {
   Modal,
   Platform,
   Pressable,
-  useColorScheme,
   StyleSheet,
   Text,
   TextInput,
@@ -36,7 +35,8 @@ import type { ConversationReader } from '../services';
 import { MessageComposer } from '../components';
 import type { Conversation, Message } from '../types';
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
-import { colors } from '../../../theme/colors';
+import { useTheme } from '../../../theme/ThemeContext';
+import type { AppColors } from '../../../theme/palettes';
 import { useChatStore } from '../chat.store';
 import { joinConversationRoom, leaveConversationRoom } from '../../../services/socket';
 import { translateToEnglish } from '../../../services/translate';
@@ -111,23 +111,24 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   } = route.params;
 
   const insets = useSafeAreaInsets();
-  const isDark = useColorScheme() === 'dark';
+  const { colors, isDark } = useTheme();
+  const styles = useMemo(() => createDetailStyles(colors), [colors]);
   const ui = useMemo(
     () => ({
-      bg: isDark ? '#0B141A' : '#EFEAE2',
-      headerBg: isDark ? '#111B21' : colors.backgroundSecondary,
-      headerBorder: isDark ? 'rgba(255,255,255,0.10)' : colors.border,
-      text: isDark ? '#E9EDEF' : colors.text,
-      textMuted: isDark ? 'rgba(233,237,239,0.72)' : colors.textMuted,
-      inBubble: isDark ? '#1F2C34' : colors.chatBubbleIn,
-      outBubble: isDark ? '#005C4B' : colors.chatBubbleOut,
-      bubbleMeta: isDark ? 'rgba(233,237,239,0.65)' : colors.textMuted,
+      bg: colors.chatWallpaper,
+      headerBg: colors.backgroundSecondary,
+      headerBorder: colors.border,
+      text: colors.text,
+      textMuted: colors.textMuted,
+      inBubble: colors.chatBubbleIn,
+      outBubble: colors.chatBubbleOut,
+      bubbleMeta: colors.textMuted,
       dateChipBg: isDark ? 'rgba(17,27,33,0.85)' : 'rgba(225,228,234,0.92)',
-      dateChipText: isDark ? 'rgba(233,237,239,0.78)' : colors.textSecondary,
-      reactionChipBg: isDark ? '#1F2C34' : '#FFF',
-      reactionChipBorder: isDark ? 'rgba(255,255,255,0.10)' : colors.border,
+      dateChipText: colors.textSecondary,
+      reactionChipBg: isDark ? colors.surface : '#FFF',
+      reactionChipBorder: colors.border,
     }),
-    [isDark]
+    [colors, isDark],
   );
 
   // Self-chat ("You") always sends directly — never template-only.
@@ -1727,7 +1728,8 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+function createDetailStyles(colors: AppColors) {
+  return StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
@@ -2494,4 +2496,5 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontVariant: ['tabular-nums'],
   },
-});
+  });
+}

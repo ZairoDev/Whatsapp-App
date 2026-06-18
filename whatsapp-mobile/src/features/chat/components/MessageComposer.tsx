@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActionSheetIOS,
   ActivityIndicator,
@@ -31,7 +31,8 @@ import {
   uploadToBunny,
 } from '../services';
 import type { WhatsAppTemplate } from '../services';
-import { colors } from '../../../theme/colors';
+import { useTheme } from '../../../theme/ThemeContext';
+import type { AppColors } from '../../../theme/palettes';
 
 /** Format milliseconds remaining into "Xh Ym" or "Ym Zs" */
 function formatCountdown(ms: number): string {
@@ -101,6 +102,8 @@ export function MessageComposer({
   onOptimisticAdd,
   onOptimisticSetStatus,
 }: MessageComposerProps) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createComposerStyles(colors), [colors]);
   const insets = useSafeAreaInsets();
   const [text, setText] = useState('');
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
@@ -829,7 +832,8 @@ export function MessageComposer({
   );
 }
 
-const styles = StyleSheet.create({
+function createComposerStyles(colors: AppColors) {
+  return StyleSheet.create({
   countdownValue: {
     fontWeight: '700',
     fontSize: 12,
@@ -1162,4 +1166,5 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#fff',
   },
-});
+  });
+}

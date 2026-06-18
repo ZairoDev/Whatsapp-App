@@ -1,12 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, AppState, AppStateStatus, StyleSheet, Text, View, ActivityIndicator } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
+import { NavigationContainer, DarkTheme, DefaultTheme } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useAuthStore } from '../../features/auth/auth.store';
 import { LoginScreen, VerifyOtpScreen } from '../../features/auth/screens';
 import { DashboardScreen } from '../../features/dashboard/screens/DashboardScreen';
 import { ChatAppStack } from './ChatAppStack';
-import { colors } from '../../theme/colors';
+import { useTheme } from '../../theme/ThemeContext';
 import api from '../../services/api';
 import { connectSocket, disconnectSocket } from '../../services';
 import * as TokenManager from '../../notifications/TokenManager';
@@ -47,10 +47,11 @@ function AuthNavigator() {
 }
 
 function LoadingScreen() {
+  const { colors: themeColors } = useTheme();
   return (
-    <View style={styles.loading}>
-      <ActivityIndicator size="large" color={colors.primary} />
-      <Text style={styles.loadingText}>Loading...</Text>
+    <View style={[styles.loading, { backgroundColor: themeColors.backgroundSecondary }]}>
+      <ActivityIndicator size="large" color={themeColors.primary} />
+      <Text style={[styles.loadingText, { color: themeColors.text }]}>Loading...</Text>
     </View>
   );
 }
@@ -171,6 +172,7 @@ export function RootNavigator() {
   const isHydrated = useAuthStore((s) => s.isHydrated);
   const hydrate    = useAuthStore((s) => s.hydrate);
   const showBanner = useInAppBannerStore((s) => s.show);
+  const { isDark } = useTheme();
 
   const [isValidating, setIsValidating] = useState(false);
 
@@ -283,7 +285,11 @@ export function RootNavigator() {
   }
 
   return (
-    <NavigationContainer ref={navigationRef} onReady={handleNavigationReady}>
+    <NavigationContainer
+      ref={navigationRef}
+      onReady={handleNavigationReady}
+      theme={isDark ? DarkTheme : DefaultTheme}
+    >
       {isAuthenticated ? (
         <>
           <MainStack.Navigator screenOptions={{ headerShown: false }}>
@@ -304,11 +310,9 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: colors.backgroundSecondary,
     gap: 12,
   },
   loadingText: {
     fontSize: 16,
-    color: colors.text,
   },
 });

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   View,
   Text,
@@ -15,7 +15,9 @@ import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { login, getLoginErrorMessage } from '../services/auth.api';
 import { useAuthStore } from '../auth.store';
 import { toTokenData } from '../types';
-import { colors } from '../../../theme/colors';
+import { useTheme } from '../../../theme/ThemeContext';
+import { ThemeToggleButton } from '../../../theme/ThemeToggleButton';
+import type { AppColors } from '../../../theme/palettes';
 import type { AuthStackParamList } from '../../../core/navigation/RootNavigator';
 import { CenteredContent } from '../../../core/layout/CenteredContent';
 
@@ -26,6 +28,8 @@ const PIN_REGEX = /^\d{4}$/;
 const PIN_LENGTH = 4;
 
 export function LoginScreen({ navigation }: Props) {
+  const { colors } = useTheme();
+  const styles = useMemo(() => createLoginStyles(colors), [colors]);
   const setToken = useAuthStore((s) => s.setToken);
   const sessionExpired = useAuthStore((s) => s.sessionExpired);
   const clearSessionExpired = useAuthStore((s) => s.clearSessionExpired);
@@ -114,6 +118,9 @@ export function LoginScreen({ navigation }: Props) {
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       keyboardVerticalOffset={Platform.OS === 'ios' ? 60 : 0}
     >
+      <View style={styles.themeToggleWrap}>
+        <ThemeToggleButton compact />
+      </View>
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"
@@ -254,10 +261,17 @@ export function LoginScreen({ navigation }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+function createLoginStyles(colors: AppColors) {
+  return StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
+  },
+  themeToggleWrap: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 52 : 16,
+    right: 16,
+    zIndex: 10,
   },
   sessionBanner: {
     flexDirection: 'row',
@@ -386,4 +400,5 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#fff',
   },
-});
+  });
+}
