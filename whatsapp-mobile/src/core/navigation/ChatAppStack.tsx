@@ -9,10 +9,10 @@ import type { RootStackParamList } from './RootNavigator';
 import { useWhatsAppRealtime } from '../../features/chat/hooks';
 
 export type ChatAppStackParamList = {
-  ConversationList: { initialArea?: 'athens' | 'thessaloniki' } | undefined;
+  ConversationList: { initialArea?: string } | undefined;
   ConversationDetail: {
     conversationId: string;
-    area: 'athens' | 'thessaloniki';
+    area: string;
     conversationName?: string;
     participantPhone?: string;
     /** When true, this is a "draft" chat started by entering a phone number. */
@@ -26,7 +26,7 @@ export type ChatAppStackParamList = {
     /** Unix ms timestamp when the 24-hour messaging window closes. Used for live countdown. */
     windowExpiresAt?: number;
   };
-  ArchiveList: undefined;
+  ArchiveList: { defaultArea?: string };
   VideoPlayer: {
     items: {
       id: string;

@@ -17,10 +17,13 @@ import { useAuthStore } from '../auth.store';
 import { toTokenData } from '../types';
 import { colors } from '../../../theme/colors';
 import type { AuthStackParamList } from '../../../core/navigation/RootNavigator';
+import { CenteredContent } from '../../../core/layout/CenteredContent';
 
 type Props = NativeStackScreenProps<AuthStackParamList, 'Login'>;
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PIN_REGEX = /^\d{4}$/;
+const PIN_LENGTH = 4;
 
 export function LoginScreen({ navigation }: Props) {
   const setToken = useAuthStore((s) => s.setToken);
@@ -28,10 +31,16 @@ export function LoginScreen({ navigation }: Props) {
   const clearSessionExpired = useAuthStore((s) => s.clearSessionExpired);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [mobilePin, setMobilePin] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [showPin, setShowPin] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [fieldErrors, setFieldErrors] = useState<{ email?: string; password?: string }>({});
+  const [fieldErrors, setFieldErrors] = useState<{
+    email?: string;
+    password?: string;
+    mobilePin?: string;
+  }>({});
 
   // Dismiss the session-expired banner once the user starts interacting.
   useEffect(() => {
@@ -41,7 +50,7 @@ export function LoginScreen({ navigation }: Props) {
   }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
   const validate = (): boolean => {
-    const next: { email?: string; password?: string } = {};
+    const next: { email?: string; password?: string; mobilePin?: string } = {};
     if (!email.trim()) {
       next.email = 'Email is required';
     } else if (!EMAIL_REGEX.test(email.trim())) {
@@ -52,10 +61,22 @@ export function LoginScreen({ navigation }: Props) {
     } else if (password.length < 6) {
       next.password = 'Password must be at least 6 characters';
     }
+    if (!mobilePin) {
+      next.mobilePin = 'Mobile PIN is required';
+    } else if (!PIN_REGEX.test(mobilePin)) {
+      next.mobilePin = 'Mobile PIN must be exactly 4 digits';
+    }
     setFieldErrors(next);
     setError(null);
     return Object.keys(next).length === 0;
   };
+
+  const isPinValid = PIN_REGEX.test(mobilePin);
+  const canSubmit =
+    !isLoggingIn &&
+    email.trim().length > 0 &&
+    password.length >= 6 &&
+    isPinValid;
 
 
   const handleSubmit = async () => {
@@ -65,7 +86,7 @@ export function LoginScreen({ navigation }: Props) {
     setFieldErrors({});
   
     try {
-      const response = await login(email.trim(), password);
+      const response = await login(email.trim(), password, mobilePin);
 
       if (response.otpRequired === true) {
         navigation.replace('VerifyOtp', { email: email.trim() });
@@ -98,6 +119,7 @@ export function LoginScreen({ navigation }: Props) {
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
       >
+        <CenteredContent>
         {sessionExpired && (
           <View style={styles.sessionBanner}>
             <Ionicons name="warning-outline" size={18} color="#7A4100" />
@@ -108,7 +130,9 @@ export function LoginScreen({ navigation }: Props) {
         )}
 
         <Text style={styles.title}>Employee Login</Text>
-        <Text style={styles.subtitle}>Sign in with your email and password</Text>
+        <Text style={styles.subtitle}>
+          Sign in with your email, password, and 4-digit mobile PIN
+        </Text>
 
         <View style={styles.form}>
           <Text style={styles.label}>Email address</Text>
@@ -164,15 +188,55 @@ export function LoginScreen({ navigation }: Props) {
             <Text style={styles.fieldError}>{fieldErrors.password}</Text>
           ) : null}
 
+          <Text style={[styles.label, styles.labelMargin]}>Mobile PIN</Text>
+          <View style={[styles.passwordWrap, fieldErrors.mobilePin && styles.inputError]}>
+            <TextInput
+              style={[styles.passwordInput, styles.pinInput]}
+              placeholder="••••"
+              placeholderTextColor={colors.textMuted}
+              value={mobilePin}
+              onChangeText={(t) => {
+                const digitsOnly = t.replace(/\D/g, '').slice(0, PIN_LENGTH);
+                setMobilePin(digitsOnly);
+                if (fieldErrors.mobilePin) {
+                  setFieldErrors((p) => ({ ...p, mobilePin: undefined }));
+                }
+                setError(null);
+              }}
+              secureTextEntry={!showPin}
+              keyboardType="number-pad"
+              maxLength={PIN_LENGTH}
+              autoComplete="off"
+              textContentType="oneTimeCode"
+              editable={!isLoggingIn}
+              accessibilityLabel="4-digit mobile PIN input"
+            />
+            <TouchableOpacity
+              style={styles.eyeButton}
+              onPress={() => setShowPin(!showPin)}
+              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+              accessibilityLabel={showPin ? 'Hide PIN' : 'Show PIN'}
+            >
+              <Text style={styles.eyeText}>{showPin ? 'Hide' : 'Show'}</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.helperText}>
+            Enter the 4-digit PIN assigned to your mobile account.
+          </Text>
+          {fieldErrors.mobilePin ? (
+            <Text style={styles.fieldError}>{fieldErrors.mobilePin}</Text>
+          ) : null}
+
           {error ? <Text style={styles.error}>{error}</Text> : null}
 
           <TouchableOpacity
-            style={[styles.button, isLoggingIn && styles.buttonDisabled]}
+            style={[styles.button, !canSubmit && styles.buttonDisabled]}
             onPress={handleSubmit}
-            disabled={isLoggingIn}
+            disabled={!canSubmit}
             activeOpacity={0.8}
             accessibilityRole="button"
             accessibilityLabel="Continue login"
+            accessibilityState={{ disabled: !canSubmit }}
           >
             {isLoggingIn ? (
               <View style={styles.buttonContent}>
@@ -184,6 +248,7 @@ export function LoginScreen({ navigation }: Props) {
             )}
           </TouchableOpacity>
         </View>
+        </CenteredContent>
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -217,6 +282,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     paddingTop: 48,
     paddingBottom: 32,
+    justifyContent: 'center',
   },
   title: {
     fontSize: 28,
@@ -277,6 +343,16 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: colors.primary,
+  },
+  pinInput: {
+    letterSpacing: 8,
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  helperText: {
+    fontSize: 12,
+    color: colors.textMuted,
+    marginTop: 6,
   },
   fieldError: {
     fontSize: 13,

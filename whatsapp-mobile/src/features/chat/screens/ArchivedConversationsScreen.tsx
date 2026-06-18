@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   StyleSheet,
   Text,
@@ -12,9 +13,11 @@ import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
 import { colors } from '../../../theme/colors';
+import { GuestOutboundStatsBadges } from '../components/GuestOutboundStatsBadges';
 import { useChatStore } from '../chat.store';
-import { fetchArchivedConversations } from '../services';
+import { fetchArchivedConversations, unarchiveConversation } from '../services';
 import type { Conversation } from '../types';
+import { resolveConversationArea } from '../utils/locations';
 
 type Props = NativeStackScreenProps<ChatAppStackParamList, 'ArchiveList'>;
 
@@ -37,33 +40,64 @@ function formatListDate(ts?: number): string {
   return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: '2-digit' });
 }
 
-export function ArchivedConversationsScreen({ navigation }: Props) {
+export function ArchivedConversationsScreen({ navigation, route }: Props) {
   const { setActiveConversation } = useChatStore();
   const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const defaultArea = route.params.defaultArea ?? 'athens';
+
+  const loadArchived = useCallback(async (silent = false) => {
+    let cancelled = false;
+    if (!silent) setLoading(true);
+    setError(null);
+    try {
+      const conversations = await fetchArchivedConversations();
+      if (!cancelled) setArchivedConversations(conversations);
+    } catch (e) {
+      if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load archived conversations');
+    } finally {
+      if (!cancelled && !silent) setLoading(false);
+    }
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      setLoading(true);
+      setError(null);
       try {
-        setLoading(true);
-        setError(null);
         const conversations = await fetchArchivedConversations();
-        if (!cancelled) {
-          setArchivedConversations(conversations);
-        }
+        if (!cancelled) setArchivedConversations(conversations);
       } catch (e) {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : 'Failed to load archived conversations');
-        }
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load archived conversations');
       } finally {
         if (!cancelled) setLoading(false);
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleUnarchive = useCallback(async (item: Conversation) => {
+    Alert.alert(
+      'Unarchive chat',
+      `Move "${item.name}" back to your inbox?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Unarchive',
+          onPress: async () => {
+            try {
+              await unarchiveConversation(item.id);
+              setArchivedConversations((prev) => prev.filter((c) => c.id !== item.id));
+            } catch (e) {
+              Alert.alert('Error', e instanceof Error ? e.message : 'Could not unarchive');
+            }
+          },
+        },
+      ],
+    );
   }, []);
 
   const renderRow = ({ item }: { item: Conversation }) => (
@@ -74,13 +108,15 @@ export function ArchivedConversationsScreen({ navigation }: Props) {
         setActiveConversation(item.id);
         navigation.navigate('ConversationDetail', {
           conversationId: item.id,
-          area: 'athens', // archived is global; area is not relevant for messages API here
+          area: resolveConversationArea(item, defaultArea),
           conversationName: item.name,
           participantPhone: item.phone,
           isSelf: item.isSelf,
           templateOnly: item.templateOnly,
         });
       }}
+      onLongPress={() => handleUnarchive(item)}
+      delayLongPress={400}
     >
       <View style={styles.avatar}>
         <Text style={styles.avatarText}>{getInitials(item.name)}</Text>
@@ -108,7 +144,16 @@ export function ArchivedConversationsScreen({ navigation }: Props) {
             </View>
           )}
         </View>
+        <GuestOutboundStatsBadges conversation={item} />
       </View>
+      <TouchableOpacity
+        style={styles.unarchiveBtn}
+        onPress={() => handleUnarchive(item)}
+        hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        accessibilityLabel="Unarchive"
+      >
+        <Ionicons name="archive-outline" size={18} color={colors.textMuted} />
+      </TouchableOpacity>
     </TouchableOpacity>
   );
 
@@ -262,6 +307,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     color: '#fff',
+  },
+  unarchiveBtn: {
+    paddingLeft: 10,
+    paddingVertical: 4,
   },
 });
 

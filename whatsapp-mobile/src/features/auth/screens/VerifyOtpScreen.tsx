@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
+  ScrollView,
 } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useAuthStore } from '../auth.store';
@@ -15,6 +16,7 @@ import { verifyOtp, resendOtp, getVerifyOtpErrorMessage } from '../services/auth
 import { toTokenData } from '../types';
 import { colors } from '../../../theme/colors';
 import type { AuthStackParamList } from '../../../core/navigation/RootNavigator';
+import { CenteredContent } from '../../../core/layout/CenteredContent';
 
 const OTP_LENGTH = 6;
 const RESEND_COOLDOWN_SEC = 30;
@@ -106,7 +108,12 @@ export function VerifyOtpScreen({ route, navigation }: Props) {
         <Text style={styles.backText}>← Back</Text>
       </TouchableOpacity>
 
-      <View style={styles.content}>
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+      >
+        <CenteredContent style={styles.content}>
         <Text style={styles.title}>Verify OTP</Text>
         <Text style={styles.subtitle}>
           Enter the 6-digit code sent to{'\n'}
@@ -167,7 +174,8 @@ export function VerifyOtpScreen({ route, navigation }: Props) {
             </TouchableOpacity>
           )}
         </View>
-      </View>
+        </CenteredContent>
+      </ScrollView>
     </KeyboardAvoidingView>
   );
 }
@@ -189,10 +197,15 @@ const styles = StyleSheet.create({
     color: colors.primary,
     fontWeight: '500',
   },
-  content: {
-    flex: 1,
+  scrollContent: {
+    flexGrow: 1,
     paddingHorizontal: 24,
-    paddingTop: 24,
+    paddingTop: 8,
+    paddingBottom: 32,
+    justifyContent: 'center',
+  },
+  content: {
+    paddingTop: 16,
   },
   title: {
     fontSize: 28,

@@ -4,7 +4,7 @@ import {
   View,
   TouchableOpacity,
   FlatList,
-  Dimensions,
+  useWindowDimensions,
   Text,
   Image,
 } from 'react-native';
@@ -18,19 +18,25 @@ type Props = NativeStackScreenProps<ChatAppStackParamList, 'VideoPlayer'>;
 
 export type MediaGalleryItem = ChatAppStackParamList['VideoPlayer']['items'][number];
 
-const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
-
-function MediaSlide({ item }: { item: MediaGalleryItem }) {
+function MediaSlide({
+  item,
+  width,
+  height,
+}: {
+  item: MediaGalleryItem;
+  width: number;
+  height: number;
+}) {
   const isVideo = item.type === 'video';
   const mediaUri = item.uri;
   const thumbnailUri = item.thumbnailUri;
 
   return (
-    <View style={slideStyles.slide}>
+    <View style={[slideStyles.slide, { width, height }]}>
       {isVideo ? (
         <Video
           source={{ uri: mediaUri }}
-          style={slideStyles.media}
+          style={{ width, height, backgroundColor: 'black' }}
           resizeMode={ResizeMode.COVER}
           useNativeControls
           shouldPlay
@@ -39,13 +45,8 @@ function MediaSlide({ item }: { item: MediaGalleryItem }) {
           usePoster={!!thumbnailUri}
         />
       ) : (
-        
-        <View style={slideStyles.imageWrap}>
-          <Image
-            source={{ uri: mediaUri }}
-            style={slideStyles.media}
-            resizeMode="cover"
-          />
+        <View style={[slideStyles.imageWrap, { width, height }]}>
+          <Image source={{ uri: mediaUri }} style={{ width, height }} resizeMode="cover" />
         </View>
       )}
     </View>
@@ -54,50 +55,13 @@ function MediaSlide({ item }: { item: MediaGalleryItem }) {
 
 const slideStyles = StyleSheet.create({
   slide: {
-    width: SCREEN_WIDTH,
-    height: SCREEN_HEIGHT,
     justifyContent: 'center',
     alignItems: 'center',
-  },
-  media: {
-    width: SCREEN_WIDTH,
-    height: SCREEN_HEIGHT,
-    backgroundColor: 'black',
   },
   imageWrap: {
-    width: SCREEN_WIDTH,
-    height: SCREEN_HEIGHT,
     backgroundColor: 'black',
     justifyContent: 'center',
     alignItems: 'center',
-  },
-  topLabelContainer: {
-    position: 'absolute',
-    top: 12,
-    left: 12,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 6,
-    backgroundColor: 'rgba(0,0,0,0.65)',
-  },
-  topLabelText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#C8F36A', // WhatsApp-like green
-  },
-  bottomLabelContainer: {
-    position: 'absolute',
-    right: 12,
-    bottom: 12,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 6,
-    backgroundColor: 'rgba(0,0,0,0.7)',
-  },
-  bottomLabelText: {
-    fontSize: 11,
-    fontWeight: '500',
-    color: '#fff',
   },
 });
 
@@ -105,9 +69,10 @@ export function VideoPlayerScreen({ route, navigation }: Props) {
   const { items, initialIndex } = route.params;
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const flatListRef = useRef<FlatList<MediaGalleryItem>>(null);
+  const { width, height } = useWindowDimensions();
 
   const renderItem = ({ item }: { item: MediaGalleryItem }) => (
-    <MediaSlide item={item} />
+    <MediaSlide item={item} width={width} height={height} />
   );
 
   return (
@@ -136,14 +101,14 @@ export function VideoPlayerScreen({ route, navigation }: Props) {
         pagingEnabled
         initialScrollIndex={initialIndex}
         getItemLayout={(_, index) => ({
-          length: SCREEN_WIDTH,
-          offset: SCREEN_WIDTH * index,
+          length: width,
+          offset: width * index,
           index,
         })}
         showsHorizontalScrollIndicator={false}
         renderItem={renderItem}
         onMomentumScrollEnd={(event) => {
-          const newIndex = Math.round(event.nativeEvent.contentOffset.x / SCREEN_WIDTH);
+          const newIndex = Math.round(event.nativeEvent.contentOffset.x / width);
           if (!Number.isNaN(newIndex)) {
             setCurrentIndex(newIndex);
           }
@@ -188,4 +153,3 @@ const styles = StyleSheet.create({
     color: '#fff',
   },
 });
-

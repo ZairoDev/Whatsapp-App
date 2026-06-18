@@ -5,8 +5,8 @@ import {
   StyleSheet,
   Text,
   View,
-  Dimensions,
   Platform,
+  useWindowDimensions,
 } from 'react-native';
 
 import { useInAppBannerStore } from './inAppBannerStore';
@@ -14,9 +14,7 @@ import { colors } from '../theme/colors';
 import { navigate } from '../core/navigation/navigationRef';
 import { useChatStore } from '../features/chat/chat.store';
 
-function resolveAreaFromBusinessPhoneId(
-  businessPhoneId: string | undefined,
-): 'athens' | 'thessaloniki' {
+function resolveAreaFromBusinessPhoneId(businessPhoneId: string | undefined): string {
   const configs = useChatStore.getState().phoneConfigs ?? [];
   const cfg = businessPhoneId
     ? configs.find((c) => String(c.phoneNumberId) === String(businessPhoneId))
@@ -30,7 +28,8 @@ function resolveAreaFromBusinessPhoneId(
         ? areaRaw[0]
         : undefined;
 
-  return area === 'thessaloniki' ? 'thessaloniki' : 'athens';
+  const key = typeof area === 'string' ? area.split(',')[0]?.toLowerCase().trim() : '';
+  return key || 'athens';
 }
 
 export function InAppNotificationBanner() {
@@ -38,7 +37,7 @@ export function InAppNotificationBanner() {
   const payload = useInAppBannerStore((s) => s.payload);
   const hide = useInAppBannerStore((s) => s.hide);
 
-  const screenWidth = Dimensions.get('window').width;
+  const { width: screenWidth } = useWindowDimensions();
   const topInset = Platform.OS === 'android' ? 10 : 18;
   const translateY = useRef(new Animated.Value(-120)).current;
   const opacity = useRef(new Animated.Value(0)).current;

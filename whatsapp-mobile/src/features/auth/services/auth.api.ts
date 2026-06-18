@@ -9,6 +9,13 @@ type ApiError = Error & {
   data?: unknown;
 };
 
+// All auth requests from the mobile app must identify themselves so the backend
+// routes reads/writes to the correct session slot (mobileSession, not webSession).
+const MOBILE_HEADERS: Record<string, string> = {
+  'Content-Type': 'application/json',
+  'x-device-type': 'mobile',
+};
+
 async function request<T>(
   path: string,
   body: object,
@@ -21,7 +28,7 @@ async function request<T>(
     const res = await fetch(`${AUTH_BASE_URL}${path}`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        ...MOBILE_HEADERS,
         ...(extraHeaders ?? {}),
       },
       body: JSON.stringify(body),
@@ -32,7 +39,11 @@ async function request<T>(
 
     const data = (await res.json().catch(() => ({}))) as T | { error?: string };
     if (!res.ok) {
-      const err: ApiError = new Error(typeof (data as { error?: string }).error === 'string' ? (data as { error?: string }).error : 'Request failed');
+      const err: ApiError = new Error(
+        typeof (data as { error?: string }).error === 'string'
+          ? (data as { error?: string }).error
+          : 'Request failed',
+      );
       err.response = res;
       err.status = res.status;
       err.data = data;
@@ -45,6 +56,11 @@ async function request<T>(
       const apiErr = e as ApiError;
       if (e.name === 'AbortError') {
         apiErr.message = 'Request timed out. Please check your connection and try again.';
+      } else if (!apiErr.status) {
+        // Pure network error (connection refused, DNS failure, etc.)
+        // Likely the device can't reach the server — common when localhost is used
+        // instead of the machine's LAN IP.
+        apiErr.message = `Cannot connect to server. Make sure your phone and computer are on the same Wi-Fi. (${e.message})`;
       }
       throw e;
     }
@@ -52,20 +68,18 @@ async function request<T>(
   }
 }
 
-export async function login(email: string, password: string): Promise<LoginResponse> {
-  return request<LoginResponse>('/employeelogin', { email, password });
+export async function login(
+  email: string,
+  password: string,
+  mobilePin: string,
+): Promise<LoginResponse> {
+  return request<LoginResponse>('/employeelogin', { email, password, mobilePin });
 }
 
 export async function verifyOtp(otp: string, email: string): Promise<VerifyOtpResponse> {
-  // Backend derives email from the Referer header: referer?.split(\"otp/\")[1]
-  // Mobile doesn't set this automatically, so we fake a web-like referer here.
-  const referer = `https://mobile-app/otp/${email}`;
-  return request<VerifyOtpResponse>(
-    '/verify-otp',
-    { otp },
-    { referer },
-  );
-
+  // Send email in the body — the backend now reads email from the request body first,
+  // then falls back to the Referer header for web compatibility.
+  return request<VerifyOtpResponse>('/verify-otp', { otp, email });
 }
 
 export async function resendOtp(email: string): Promise<ResendOtpResponse> {
@@ -77,13 +91,13 @@ export async function employeeLogout(token: string): Promise<{ message?: string;
   const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
   try {
-    const res = await fetch(`${AUTH_BASE_URL}/employeeLogout`, {
-      method: 'POST',
+    // The logout endpoint is a GET route; pass the token via Authorization header.
+    const res = await fetch(`${AUTH_BASE_URL}/employeelogout`, {
+      method: 'GET',
       headers: {
-        'Content-Type': 'application/json',
+        ...MOBILE_HEADERS,
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({}),
       signal: controller.signal,
     });
 
@@ -92,7 +106,7 @@ export async function employeeLogout(token: string): Promise<{ message?: string;
     const data = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
     if (!res.ok) {
       const err: ApiError = new Error(
-        typeof data.error === 'string' ? data.error : 'Logout failed'
+        typeof data.error === 'string' ? data.error : 'Logout failed',
       );
       (err as ApiError).response = res;
       (err as ApiError).status = res.status;
@@ -106,6 +120,8 @@ export async function employeeLogout(token: string): Promise<{ message?: string;
       const apiErr = e as ApiError;
       if (e.name === 'AbortError') {
         apiErr.message = 'Request timed out. Please check your connection and try again.';
+      } else if (!apiErr.status) {
+        apiErr.message = `Cannot connect to server. (${e.message})`;
       }
       throw e;
     }
@@ -122,6 +138,7 @@ export function getLoginErrorMessage(err: unknown): string {
     const data = err.data as { error?: string } | undefined;
     const msg = data?.error;
     if (typeof msg === 'string' && msg) return msg;
+    if (err.status === 409) return 'This account is already logged in on another device.';
     if (err.status === 401) return 'Invalid email or password.';
     if (err.status === 404) return 'Service not found. Please try again later.';
     if (err.message?.includes('timed out')) return err.message;

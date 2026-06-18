@@ -1,5 +1,13 @@
 import React, { useMemo, useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator } from 'react-native';
+import {
+  View,
+  Text,
+  StyleSheet,
+  Pressable,
+  ActivityIndicator,
+  ScrollView,
+  Platform,
+} from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { useAuthStore } from '../../../features/auth/auth.store';
 import { employeeLogout } from '../../../features/auth/services/auth.api';
@@ -7,6 +15,13 @@ import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../../../core/navigation/RootNavigator';
 import { colors } from '../../../theme/colors';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import {
+  getUserScopedLocationKeys,
+  hasFullLocationAccess,
+  isSuperAdminRole,
+} from '../../chat/utils/locations';
+import { NotificationStatusCard } from '../components/NotificationStatusCard';
 
 type DashboardNav = NativeStackNavigationProp<RootStackParamList, 'Main'>;
 
@@ -15,17 +30,23 @@ export function DashboardScreen() {
   const clearToken = useAuthStore((s) => s.clearToken);
   const [loggingOut, setLoggingOut] = useState(false);
   const navigation = useNavigation<DashboardNav>();
-  const { canSeeAthens, canSeeThessaloniki } = useMemo(() => {
+  const insets = useSafeAreaInsets();
+  const { hasWhatsAppAccess, whatsAppInitialArea } = useMemo(() => {
     const role = tokenData?.role ?? '';
-    const areas = tokenData?.allotedArea ?? [];
-    const lowerAreas = areas.map((a) => a.toLowerCase());
-    const isSuperAdmin = role.toLowerCase().includes('super');
+    const allottedKeys = getUserScopedLocationKeys(tokenData?.allotedArea);
+    const hasAccess =
+      isSuperAdminRole(role) ||
+      hasFullLocationAccess(role) ||
+      allottedKeys.length > 0;
 
     return {
-      canSeeAthens: isSuperAdmin || lowerAreas.includes('athens'),
-      canSeeThessaloniki: isSuperAdmin || lowerAreas.includes('thessaloniki'),
+      hasWhatsAppAccess: hasAccess,
+      whatsAppInitialArea: allottedKeys[0] ?? 'athens',
     };
   }, [tokenData?.role, tokenData?.allotedArea]);
+
+  const displayName = (tokenData?.name ?? '').trim() || 'there';
+  const roleLabel = (tokenData?.role ?? '').toString().trim();
 
   const handleLogout = async () => {
     const token = tokenData?.token;
@@ -45,117 +66,345 @@ export function DashboardScreen() {
   };
 
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>Dashboard</Text>
-
-      <View style={styles.appsRow}>
-        {canSeeAthens && (
-          <TouchableOpacity
-            style={styles.appCard}
-            activeOpacity={0.9}
-            onPress={() => navigation.navigate('ChatApp', { initialArea: 'athens' })}
-          >
-            <View style={styles.appHeader}>
-              <FontAwesome name="whatsapp" size={24} color={colors.primary} />
-              <Text style={styles.appTitle}>WhatsApp Athens</Text>
+    <View style={styles.screen}>
+      <ScrollView
+        contentContainerStyle={[
+          styles.content,
+          { paddingTop: Math.max(insets.top, 12), paddingBottom: Math.max(insets.bottom, 16) },
+        ]}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.headerRow}>
+          <View style={styles.headerText}>
+            <Text style={styles.kicker}>Dashboard</Text>
+            <View style={styles.titleRow}>
+              <Text style={styles.title}>Hi, {displayName}</Text>
+              {!!roleLabel && (
+                <View style={styles.rolePill} accessibilityLabel={`Role ${roleLabel}`}>
+                  <Text style={styles.rolePillText}>{roleLabel}</Text>
+                </View>
+              )}
             </View>
-            <Text style={styles.appSubtitle}>Manage Athens chats and routes</Text>
-          </TouchableOpacity>
-        )}
+            <Text style={styles.subtitle}>
+              {hasWhatsAppAccess
+                ? 'Open WhatsApp to manage your conversations.'
+                : 'No workspaces assigned yet.'}
+            </Text>
+          </View>
 
-        {canSeeThessaloniki && (
-          <TouchableOpacity
-            style={styles.appCard}
-            activeOpacity={0.9}
-            onPress={() => navigation.navigate('ChatApp', { initialArea: 'thessaloniki' })}
+          <Pressable
+            onPress={handleLogout}
+            disabled={loggingOut}
+            accessibilityRole="button"
+            accessibilityLabel="Log out"
+            hitSlop={12}
+            style={({ pressed }) => [
+              styles.iconButton,
+              pressed && !loggingOut ? styles.pressed : null,
+              loggingOut ? styles.disabled : null,
+            ]}
           >
-            <View style={styles.appHeader}>
-              <FontAwesome name="whatsapp" size={24} color={colors.primary} />
-              <Text style={styles.appTitle}>WhatsApp Thessaloniki</Text>
-            </View>
-            <Text style={styles.appSubtitle}>Manage Thessaloniki chats and routes</Text>
-          </TouchableOpacity>
-        )}
+            {loggingOut ? (
+              <ActivityIndicator size="small" color={colors.textSecondary} />
+            ) : (
+              <FontAwesome name="sign-out" size={18} color={colors.textSecondary} />
+            )}
+          </Pressable>
+        </View>
+
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Your workspaces</Text>
+            <Text style={styles.sectionMeta}>Tap to open</Text>
+          </View>
+
+          <View style={styles.cardsGrid}>
+            {hasWhatsAppAccess ? (
+              <WorkspaceCard
+                title="WhatsApp"
+                subtitle="Chats and conversations"
+                onPress={() =>
+                  navigation.navigate('ChatApp', { initialArea: whatsAppInitialArea })
+                }
+              />
+            ) : (
+              <View style={styles.emptyCard} accessibilityLabel="No workspaces available">
+                <View style={styles.emptyIcon}>
+                  <FontAwesome name="lock" size={16} color={colors.textMuted} />
+                </View>
+                <Text style={styles.emptyTitle}>No access yet</Text>
+                <Text style={styles.emptySubtitle}>
+                  Ask an admin to assign you an area to start managing chats.
+                </Text>
+              </View>
+            )}
+
+            <ComingSoonCard />
+          </View>
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Device</Text>
+          <NotificationStatusCard />
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
+function WorkspaceCard({
+  title,
+  subtitle,
+  onPress,
+}: {
+  title: string;
+  subtitle: string;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`Open ${title} workspace`}
+      android_ripple={{ color: 'rgba(0,0,0,0.06)' }}
+      style={({ pressed }) => [styles.card, pressed && Platform.OS === 'ios' ? styles.cardPressed : null]}
+    >
+      <View style={styles.cardTop}>
+        <View style={styles.cardIcon}>
+          <FontAwesome name="whatsapp" size={18} color={colors.primary} />
+        </View>
+        <FontAwesome name="chevron-right" size={14} color={colors.textMuted} />
       </View>
 
-      <TouchableOpacity
-        style={[styles.logoutButton, loggingOut && styles.logoutButtonDisabled]}
-        onPress={handleLogout}
-        disabled={loggingOut}
-        activeOpacity={0.8}
-        accessibilityRole="button"
-        accessibilityLabel="Log out"
-      >
-        {loggingOut ? (
-          <ActivityIndicator size="small" color="#fff" />
-        ) : (
-          <Text style={styles.logoutText}>Log out</Text>
-        )}
-      </TouchableOpacity>
+      <Text style={styles.cardTitle}>{title}</Text>
+      <Text style={styles.cardSubtitle}>{subtitle}</Text>
+    </Pressable>
+  );
+}
+
+function ComingSoonCard() {
+  return (
+    <View
+      style={[styles.card, styles.cardDisabled]}
+      accessibilityRole="text"
+      accessibilityLabel="Coming soon"
+    >
+      <View style={styles.cardTop}>
+        <View style={[styles.cardIcon, styles.cardIconMuted]}>
+          <FontAwesome name="clock-o" size={18} color={colors.textMuted} />
+        </View>
+      </View>
+
+      <Text style={[styles.cardTitle, styles.cardTitleMuted]}>Coming soon</Text>
+      <Text style={styles.cardSubtitle}>More tools on the way</Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
+  screen: {
     flex: 1,
-    justifyContent: 'center',
+    backgroundColor: colors.backgroundSecondary,
+  },
+  content: {
+    paddingHorizontal: 18,
+    gap: 18,
+  },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  headerText: {
+    flex: 1,
+    gap: 6,
+  },
+  kicker: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.textMuted,
+    letterSpacing: 0.7,
+    textTransform: 'uppercase',
+  },
+  titleRow: {
+    flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: colors.background,
-    gap: 32,
+    gap: 10,
+    flexWrap: 'wrap',
   },
   title: {
     fontSize: 28,
-    fontWeight: '700',
+    fontWeight: '800',
     color: colors.text,
+    letterSpacing: -0.3,
   },
-  appsRow: {
-    flexDirection: 'row',
-    gap: 16,
-    paddingHorizontal: 24,
+  rolePill: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: colors.primaryLight,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(18, 140, 126, 0.14)',
   },
-  appCard: {
-    flex: 1,
-    minWidth: 150,
-    maxWidth: 200,
-    paddingVertical: 16,
-    paddingHorizontal: 14,
+  rolePillText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.primaryDark,
+    textTransform: 'capitalize',
+  },
+  subtitle: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    lineHeight: 20,
+  },
+  iconButton: {
+    height: 44,
+    width: 44,
+    borderRadius: 14,
     backgroundColor: colors.surface,
-    borderRadius: 12,
     borderWidth: 1,
     borderColor: colors.border,
-  },
-  appHeader: {
-    flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    marginBottom: 4,
+    justifyContent: 'center',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#0B141A',
+        shadowOpacity: 0.06,
+        shadowRadius: 14,
+        shadowOffset: { width: 0, height: 6 },
+      },
+      android: { elevation: 2 },
+    }),
   },
-  appTitle: {
+  pressed: {
+    opacity: 0.78,
+  },
+  disabled: {
+    opacity: 0.65,
+  },
+  section: {
+    gap: 12,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  sectionTitle: {
     fontSize: 16,
-    fontWeight: '700',
+    fontWeight: '800',
     color: colors.text,
-    marginBottom: 4,
+    letterSpacing: -0.1,
   },
-  appSubtitle: {
-    fontSize: 13,
+  sectionMeta: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textMuted,
+  },
+  cardsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+  },
+  card: {
+    width: '48%',
+    minWidth: 160,
+    padding: 14,
+    backgroundColor: colors.surface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: colors.border,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#0B141A',
+        shadowOpacity: 0.06,
+        shadowRadius: 18,
+        shadowOffset: { width: 0, height: 10 },
+      },
+      android: { elevation: 2 },
+    }),
+  },
+  cardPressed: {
+    transform: [{ scale: 0.99 }],
+    opacity: 0.92,
+  },
+  cardDisabled: {
+    opacity: 0.72,
+    backgroundColor: colors.backgroundSecondary,
+  },
+  cardIconMuted: {
+    backgroundColor: colors.backgroundSecondary,
+    borderColor: colors.border,
+  },
+  cardTitleMuted: {
     color: colors.textSecondary,
   },
-  logoutButton: {
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    backgroundColor: colors.error,
-    borderRadius: 10,
-    minWidth: 120,
+  cardTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  cardIcon: {
+    height: 36,
+    width: 36,
+    borderRadius: 12,
+    backgroundColor: 'rgba(37, 211, 102, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(37, 211, 102, 0.18)',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  logoutButtonDisabled: {
-    opacity: 0.7,
-  },
-  logoutText: {
+  cardTitle: {
     fontSize: 16,
-    fontWeight: '600',
-    color: '#fff',
+    fontWeight: '800',
+    color: colors.text,
+    letterSpacing: -0.1,
+    marginBottom: 4,
+  },
+  cardSubtitle: {
+    fontSize: 13,
+    color: colors.textSecondary,
+    lineHeight: 18,
+  },
+  emptyCard: {
+    width: '100%',
+    padding: 16,
+    backgroundColor: colors.surface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: colors.border,
+    gap: 8,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#0B141A',
+        shadowOpacity: 0.05,
+        shadowRadius: 18,
+        shadowOffset: { width: 0, height: 10 },
+      },
+      android: { elevation: 1 },
+    }),
+  },
+  emptyIcon: {
+    height: 40,
+    width: 40,
+    borderRadius: 14,
+    backgroundColor: colors.backgroundSecondary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  emptyTitle: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: colors.text,
+  },
+  emptySubtitle: {
+    fontSize: 13,
+    color: colors.textSecondary,
+    lineHeight: 18,
   },
 });

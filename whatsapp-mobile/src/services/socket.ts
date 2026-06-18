@@ -16,6 +16,10 @@ let socket: Socket | null = null;
  */
 const activePhoneRooms = new Set<string>();
 const activeConversationRooms = new Set<string>();
+/** WhatsApp channel rooms (stable channel IDs from DB, not phone IDs) */
+const activeChannelRooms = new Set<string>();
+/** Retarget room (Advert/SuperAdmin only) */
+let joinedRetargetRoom = false;
 
 export function getSocket(): Socket | null {
   return socket;
@@ -80,6 +84,17 @@ export function connectSocket(token?: string): Socket {
     for (const convId of activeConversationRooms) {
       s.emit('join-conversation', convId);
     }
+    for (const channelId of activeChannelRooms) {
+      s.emit('join-whatsapp-channel', channelId);
+    }
+    if (joinedCallsRoom) {
+      s.emit('join-whatsapp-calls-room');
+    }
+    if (joinedRetargetRoom) {
+      s.emit('join-whatsapp-retarget');
+    }
+    // Join sync room for history sync events
+    s.emit('join-whatsapp-sync-room');
   });
 
   return socket;
@@ -97,6 +112,33 @@ export function leaveWhatsAppPhone(phoneNumberId: string) {
   if (socket?.connected) socket.emit('leave-whatsapp-phone', phoneNumberId);
 }
 
+/** Join a stable WhatsApp channel room (by DB channel ID, not phone number ID) */
+export function joinWhatsAppChannel(channelId: string) {
+  if (!channelId) return;
+  activeChannelRooms.add(channelId);
+  if (socket?.connected) socket.emit('join-whatsapp-channel', channelId);
+}
+
+/** Leave a WhatsApp channel room */
+export function leaveWhatsAppChannel(channelId: string) {
+  activeChannelRooms.delete(channelId);
+  if (socket?.connected) socket.emit('leave-whatsapp-channel', channelId);
+}
+
+/** Join the retarget room (Advert/SuperAdmin only) */
+export function joinWhatsAppRetargetRoom() {
+  if (joinedRetargetRoom) return;
+  joinedRetargetRoom = true;
+  if (socket?.connected) socket.emit('join-whatsapp-retarget');
+}
+
+/** Leave the retarget room */
+export function leaveWhatsAppRetargetRoom() {
+  if (!joinedRetargetRoom) return;
+  joinedRetargetRoom = false;
+  if (socket?.connected) socket.emit('leave-whatsapp-retarget');
+}
+
 export function joinConversationRoom(conversationId: string) {
   activeConversationRooms.add(conversationId);
   if (socket?.connected) socket.emit('join-conversation', conversationId);
@@ -107,6 +149,21 @@ export function leaveConversationRoom(conversationId: string) {
   if (socket?.connected) socket.emit('leave-conversation', conversationId);
 }
 
+/** Join global WhatsApp calls room (backend relays SDP answers / call status here). */
+let joinedCallsRoom = false;
+
+export function joinWhatsAppCallsRoom() {
+  if (joinedCallsRoom) return;
+  joinedCallsRoom = true;
+  if (socket?.connected) socket.emit('join-whatsapp-calls-room');
+}
+
+export function leaveWhatsAppCallsRoom() {
+  if (!joinedCallsRoom) return;
+  joinedCallsRoom = false;
+  if (socket?.connected) socket.emit('leave-whatsapp-calls-room');
+}
+
 export function disconnectSocket(): void {
   if (socket) {
     socket.disconnect();
@@ -115,4 +172,6 @@ export function disconnectSocket(): void {
   // Clear tracked rooms on explicit logout so a fresh login starts clean.
   activePhoneRooms.clear();
   activeConversationRooms.clear();
+  activeChannelRooms.clear();
+  joinedRetargetRoom = false;
 }

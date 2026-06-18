@@ -2,7 +2,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   FlatList,
+  Image,
   Modal,
+  Platform,
+  Pressable,
   StyleSheet,
   Text,
   TextInput,
@@ -12,20 +15,35 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import { useAuthStore } from '../../auth/auth.store';
 import { useChatStore } from '../chat.store';
 import {
+  archiveConversation,
+  createConversation,
+  fetchConversationCounts,
   fetchConversations,
+  fetchMonthlyTargetLocations,
   fetchPhoneConfigs,
-  getPhoneIdForArea,
   searchConversations,
 } from '../services';
+import {
+  formatLocationLabel,
+  getInboxLocationFilterChoices,
+  getInboxLocationOptions,
+  hasFullLocationAccess,
+  normalizeLocationKey,
+  resolveConversationArea,
+  resolveDefaultLocationKey,
+  type LocationFilterValue,
+} from '../utils/locations';
 import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStack';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-  import { useFocusEffect } from '@react-navigation/native';
+import { useFocusEffect } from '@react-navigation/native';
 import { colors } from '../../../theme/colors';
 import type { Conversation } from '../types';
 import type { ConversationSearchResult } from '../services';
-import { joinWhatsAppPhone, leaveWhatsAppPhone } from '../../../services/socket';
+import { joinWhatsAppPhone, leaveWhatsAppPhone, joinWhatsAppChannel, leaveWhatsAppChannel } from '../../../services/socket';
+import { GuestOutboundStatsBadges } from '../components/GuestOutboundStatsBadges';
 
 type Props = NativeStackScreenProps<ChatAppStackParamList, 'ConversationList'>;
 
@@ -57,7 +75,8 @@ function escapeRegExp(str: string): string {
 }
 
 export function ConversationListScreen({ route, navigation }: Props) {
-  const { conversations, setConversations, appendConversations, phoneConfigs, setPhoneConfigs } = useChatStore();
+  const tokenData = useAuthStore((s) => s.tokenData);
+  const { conversations, setConversations, appendConversations, phoneConfigs, setPhoneConfigs, archivedCount, setArchivedCount } = useChatStore();
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,38 +91,115 @@ export function ConversationListScreen({ route, navigation }: Props) {
   const [showNewChatModal, setShowNewChatModal] = useState(false);
   const [countryCode, setCountryCode] = useState('+30');
   const [phoneNumber, setPhoneNumber] = useState('');
+  const [newContactName, setNewContactName] = useState('');
+  const [newContactType, setNewContactType] = useState<'owner' | 'guest'>('owner');
+  const [newContactLocation, setNewContactLocation] = useState('');
   const [newChatError, setNewChatError] = useState<string | null>(null);
-  /** Tracks which area the in-memory list was last loaded for (not persisted). */
-  const lastFetchedAreaRef = useRef<string | null>(null);
+  const [locationFilter, setLocationFilter] = useState<LocationFilterValue>('all');
+  /**
+   * When true, fetch conversations with no participantLocationKey (admin queue).
+   * Only shown to full-access roles (SuperAdmin / Admin / Developer).
+   */
+  const [adminQueue, setAdminQueue] = useState(false);
+  const [monthlyTargetCities, setMonthlyTargetCities] = useState<string[]>([]);
+  const [showLocationFilterModal, setShowLocationFilterModal] = useState(false);
+  const [avatarPreviewUri, setAvatarPreviewUri] = useState<string | null>(null);
+  /** Tracks which inbox location filter the list was last loaded for. */
+  const lastFetchedLocationFilterRef = useRef<LocationFilterValue | null>(null);
+  const lastFetchedAdminQueueRef = useRef<boolean>(false);
   const onEndReachedCalled = useRef(false);
 
-  const initialArea = route.params?.initialArea ?? 'athens';
-  const area = initialArea as 'athens' | 'thessaloniki';
+  const locationContext = useMemo(
+    () => ({
+      role: tokenData?.role,
+      allotedArea: tokenData?.allotedArea,
+      monthlyTargetCities,
+    }),
+    [tokenData?.role, tokenData?.allotedArea, monthlyTargetCities],
+  );
 
-  // Join the phone-specific Socket.IO room for the selected area so incoming messages stream in real-time.
+  const locationOptions = useMemo(
+    () => getInboxLocationOptions(locationContext),
+    [locationContext],
+  );
+
+  const locationFilterChoices = useMemo(
+    () => getInboxLocationFilterChoices(locationContext),
+    [locationContext],
+  );
+
+  const defaultArea = useMemo(
+    () =>
+      resolveDefaultLocationKey(locationContext) ||
+      normalizeLocationKey(route.params?.initialArea ?? 'athens'),
+    [locationContext, route.params?.initialArea],
+  );
+
+  const resolveArea = useCallback(
+    (conversation?: { participantLocationKey?: string }) =>
+      resolveConversationArea(conversation ?? {}, defaultArea),
+    [defaultArea],
+  );
+
   useEffect(() => {
-    const configs = useChatStore.getState().phoneConfigs ?? [];
-    const phoneId = getPhoneIdForArea(area, configs);
-    if (phoneId) joinWhatsAppPhone(phoneId);
+    if (!tokenData) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const cities = await fetchMonthlyTargetLocations();
+        if (!cancelled) setMonthlyTargetCities(cities);
+      } catch {
+        if (!cancelled) setMonthlyTargetCities([]);
+      }
+    })();
     return () => {
-      if (phoneId) leaveWhatsAppPhone(phoneId);
+      cancelled = true;
     };
-  }, [area]);
+  }, [tokenData]);
+
+  useEffect(() => {
+    if (!newContactLocation && locationOptions.length > 0) {
+      setNewContactLocation(normalizeLocationKey(locationOptions[0]));
+    }
+  }, [locationOptions, newContactLocation]);
+
+  // Join all allowed business-line rooms (same as Adminstro web) for realtime delivery.
+  useEffect(() => {
+    const configs = phoneConfigs ?? [];
+    const phoneIds = configs.map((c) => c.phoneNumberId).filter(Boolean);
+    phoneIds.forEach((id) => joinWhatsAppPhone(id));
+    return () => {
+      phoneIds.forEach((id) => leaveWhatsAppPhone(id));
+    };
+  }, [phoneConfigs]);
+
+  // Dual-room: also join stable WhatsappChannel rooms so real-time events survive
+  // WABA/number migrations.  Mirrors the channelWatcher logic added in Adminstro web.
+  useEffect(() => {
+    const configs = phoneConfigs ?? [];
+    const channelIds = configs.map((c) => c.channelId).filter((id): id is string => Boolean(id));
+    channelIds.forEach((id) => joinWhatsAppChannel(id));
+    return () => {
+      channelIds.forEach((id) => leaveWhatsAppChannel(id));
+    };
+  }, [phoneConfigs]);
 
   // Refetch whenever this screen is focused. The old useEffect skipped loading when the
   // Zustand store already had rows for this area — but React Navigation often keeps this
   // screen mounted under the detail screen, so returning from a chat never re-ran the
   // effect and the list stayed stale vs the website (fresh GET each visit).
   //
-  // We also call /api/whatsapp/phone-configs first (exactly like the website) so the
-  // phoneId is always resolved from Meta — not from hardcoded .env values which were
-  // pointing to the wrong phone number for Thessaloniki.
+  // Phone configs come from GET /api/whatsapp/phone-configs (DB channels + legacy lines).
+  // phoneId is resolved from those configs — not from hardcoded .env values.
   useFocusEffect(
     useCallback(() => {
-      const areaChanged = lastFetchedAreaRef.current !== area;
-      lastFetchedAreaRef.current = area;
+      const filterChanged =
+        lastFetchedLocationFilterRef.current !== locationFilter ||
+        lastFetchedAdminQueueRef.current !== adminQueue;
+      lastFetchedLocationFilterRef.current = locationFilter;
+      lastFetchedAdminQueueRef.current = adminQueue;
       const hadList = useChatStore.getState().conversations.length > 0;
-      const showFullScreenLoader = !hadList || areaChanged;
+      const showFullScreenLoader = !hadList || filterChanged;
 
       let cancelled = false;
       (async () => {
@@ -115,16 +211,18 @@ export function ConversationListScreen({ route, navigation }: Props) {
           setNextCursor(null);
           setHasMore(false);
 
-          // Resolve phone configs from backend (Meta-validated) on first load or if missing.
-          // This is the same call the website makes before fetching conversations.
           let configs = useChatStore.getState().phoneConfigs;
           if (!configs) {
             configs = await fetchPhoneConfigs();
             if (!cancelled) setPhoneConfigs(configs);
           }
 
-          const phoneId = getPhoneIdForArea(area, configs);
-          const result = await fetchConversations(area, null, phoneId);
+          const [result] = await Promise.all([
+            fetchConversations({ locationFilter, adminQueue }),
+            fetchConversationCounts()
+              .then((counts) => { if (!cancelled) setArchivedCount(counts.archivedCount ?? 0); })
+              .catch(() => {}),
+          ]);
           if (!cancelled) {
             setConversations(result.conversations);
             setNextCursor(result.nextCursor);
@@ -144,7 +242,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
       return () => {
         cancelled = true;
       };
-    }, [area, setConversations, setPhoneConfigs])
+    }, [locationFilter, adminQueue, setConversations, setPhoneConfigs]),
   );
 
   const loadMore = useCallback(async () => {
@@ -153,9 +251,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
     onEndReachedCalled.current = true;
     try {
       setLoadingMore(true);
-      const configs = useChatStore.getState().phoneConfigs ?? [];
-      const phoneId = getPhoneIdForArea(area, configs);
-      const result = await fetchConversations(area, nextCursor, phoneId);
+      const result = await fetchConversations({ locationFilter, adminQueue, cursor: nextCursor });
       appendConversations(result.conversations);
       setNextCursor(result.nextCursor);
       setHasMore(result.hasMore);
@@ -165,7 +261,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
       setLoadingMore(false);
       onEndReachedCalled.current = false;
     }
-  }, [area, hasMore, nextCursor, loadingMore, appendConversations]);
+  }, [locationFilter, hasMore, nextCursor, loadingMore, appendConversations]);
 
   useEffect(() => {
     const q = searchQuery.trim();
@@ -181,7 +277,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
       try {
         setSearchLoading(true);
         setSearchError(null);
-        const results = await searchConversations(area, q);
+        const results = await searchConversations(q, { locationFilter });
         if (!cancelled) {
           setSearchResults(results);
         }
@@ -199,10 +295,13 @@ export function ConversationListScreen({ route, navigation }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [area, searchQuery]);
+  }, [locationFilter, searchQuery]);
 
   const filteredConversations = useMemo(() => {
     let list = conversations;
+    if (locationFilter !== 'all') {
+      list = list.filter((c) => (c.participantLocationKey ?? '').toLowerCase() === locationFilter);
+    }
     if (searchQuery.trim()) {
       const q = searchQuery.trim().toLowerCase();
       list = list.filter(
@@ -219,19 +318,22 @@ export function ConversationListScreen({ route, navigation }: Props) {
       list = list.filter((c) => c.isFavorite);
     }
     return list;
-  }, [conversations, searchQuery, activeFilter]);
+  }, [conversations, locationFilter, searchQuery, activeFilter]);
 
-  const archivedCount = 0; // Placeholder; could come from API later
+  // archivedCount comes from the store; refreshed via /whatsapp/conversations/counts on focus
 
   const isSelectionMode = selectedIds.length > 0;
 
   const openNewChat = useCallback(() => {
     setNewChatError(null);
     setPhoneNumber('');
+    setNewContactName('');
+    setNewContactType('owner');
+    setNewContactLocation(defaultArea);
     setShowNewChatModal(true);
-  }, []);
+  }, [defaultArea]);
 
-  const startChatWithNumber = useCallback(() => {
+  const startChatWithNumber = useCallback(async () => {
     const ccDigits = countryCode.replace(/[^\d]/g, '');
     const phoneDigits = phoneNumber.replace(/[^\d]/g, '');
     if (!ccDigits) {
@@ -242,18 +344,53 @@ export function ConversationListScreen({ route, navigation }: Props) {
       setNewChatError('Please enter a phone number');
       return;
     }
+
     const to = `${ccDigits}${phoneDigits}`;
-    setShowNewChatModal(false);
     setNewChatError(null);
-    navigation.navigate('ConversationDetail', {
-      conversationId: `draft:${to}`,
-      area,
-      conversationName: `+${to}`,
-      participantPhone: to,
-      templateOnly: true,
-      isDraft: true,
-    });
-  }, [countryCode, phoneNumber, navigation, area]);
+
+    try {
+      // Adminstro parity: create Owner/Guest conversation with a location.
+      const created = await createConversation({
+        participantPhone: to,
+        participantName: newContactName.trim() || undefined,
+        participantLocation: formatLocationLabel(newContactLocation, locationOptions),
+        conversationType: newContactType,
+        area: newContactLocation,
+      });
+      setShowNewChatModal(false);
+      navigation.navigate('ConversationDetail', {
+        conversationId: created.id,
+        area: resolveArea(created),
+        conversationName: created.name,
+        participantPhone: created.phone,
+        templateOnly: created.templateOnly,
+        isDraft: false,
+        isSelf: created.isSelf,
+        windowExpiresAt: created.windowExpiresAt,
+      });
+    } catch {
+      // Fallback: draft-only flow (still allows sending templates).
+      setShowNewChatModal(false);
+      navigation.navigate('ConversationDetail', {
+        conversationId: `draft:${to}`,
+        area: newContactLocation || defaultArea,
+        conversationName: `+${to}`,
+        participantPhone: to,
+        templateOnly: true,
+        isDraft: true,
+      });
+    }
+  }, [
+    countryCode,
+    phoneNumber,
+    navigation,
+    defaultArea,
+    locationOptions,
+    newContactName,
+    newContactType,
+    newContactLocation,
+    resolveArea,
+  ]);
 
   const clearSelection = useCallback(() => {
     setSelectedIds([]);
@@ -281,10 +418,22 @@ export function ConversationListScreen({ route, navigation }: Props) {
     clearSelection();
   }, [selectedIds, conversations, setConversations, clearSelection]);
 
-  const archiveSelection = useCallback(() => {
-    // Placeholder: wire to real archive endpoint when available.
+  const archiveSelection = useCallback(async () => {
+    if (selectedIds.length === 0) return;
+    const ids = [...selectedIds];
     clearSelection();
-  }, [clearSelection]);
+    // Archive each selected conversation via the real API
+    await Promise.allSettled(ids.map((id) => archiveConversation(id)));
+    // Remove archived conversations from the local list
+    setConversations(useChatStore.getState().conversations.filter((c) => !ids.includes(c.id)));
+    // Refresh archived count
+    try {
+      const counts = await fetchConversationCounts();
+      setArchivedCount(counts.archivedCount ?? 0);
+    } catch {
+      // non-blocking
+    }
+  }, [selectedIds, clearSelection, setConversations, setArchivedCount]);
 
   const renderHighlightedSnippet = (snippet: string | undefined, query: string) => {
     if (!snippet) {
@@ -327,7 +476,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
           } else {
             navigation.navigate('ConversationDetail', {
               conversationId: item.id,
-              area,
+              area: resolveArea(item),
               conversationName: item.name,
               participantPhone: item.phone,
               isSelf: item.isSelf,
@@ -341,10 +490,24 @@ export function ConversationListScreen({ route, navigation }: Props) {
         }}
         activeOpacity={0.7}
       >
-        <View style={styles.avatar}>
-          <Text style={styles.avatarText} numberOfLines={1}>
-            {getInitials(item.name)}
-          </Text>
+        <Pressable
+          onPress={() => {
+            const uri = item.participantProfilePic ?? item.avatar;
+            if (uri) setAvatarPreviewUri(uri);
+          }}
+          disabled={!(item.participantProfilePic || item.avatar)}
+          style={styles.avatar}
+          accessibilityRole={item.participantProfilePic || item.avatar ? 'button' : 'text'}
+          accessibilityLabel="Open profile photo"
+          hitSlop={6}
+        >
+          {item.participantProfilePic || item.avatar ? (
+            <Image source={{ uri: (item.participantProfilePic ?? item.avatar)! }} style={styles.avatarImage} />
+          ) : (
+            <Text style={styles.avatarText} numberOfLines={1}>
+              {getInitials(item.name)}
+            </Text>
+          )}
           {selectedIds.includes(item.id) && (
             <View style={styles.avatarSelectionBadge}>
               <Ionicons name="checkmark" size={16} color="#fff" />
@@ -355,12 +518,15 @@ export function ConversationListScreen({ route, navigation }: Props) {
               <Ionicons name="star" size={14} color="#fff" />
             </View>
           )}
-        </View>
+        </Pressable>
         <View style={styles.rowCenter}>
           <View style={styles.rowTop}>
-            <Text style={styles.name} numberOfLines={1}>
-              {item.name}
-            </Text>
+            <View style={styles.rowTopLeft}>
+              <Text style={styles.name} numberOfLines={1}>
+                {item.name}
+              </Text>
+              <GuestOutboundStatsBadges conversation={item} variant="inline" />
+            </View>
             <Text style={styles.date}>{formatListDate(item.lastMessageAt)}</Text>
           </View>
           <View style={styles.rowBottom}>
@@ -379,10 +545,48 @@ export function ConversationListScreen({ route, navigation }: Props) {
               </View>
             )}
           </View>
+          <View style={styles.metaRow}>
+            {!!item.conversationType && (
+              <View
+                style={[
+                  styles.typeBadgeInline,
+                  item.conversationType === 'guest'
+                    ? styles.typeBadgeInlineGuest
+                    : styles.typeBadgeInlineOwner,
+                ]}
+              >
+                <Text style={styles.typeBadgeInlineText}>
+                  {item.conversationType === 'guest' ? 'G' : 'O'}
+                </Text>
+              </View>
+            )}
+            <View
+              style={[
+                styles.pill,
+                item.participantLocationKey ? styles.pillLocation : styles.pillNoLocation,
+              ]}
+            >
+              <Ionicons
+                name="location-outline"
+                size={12}
+                color={item.participantLocationKey ? colors.textSecondary : '#B45309'}
+              />
+              <Text
+                style={[
+                  styles.pillText,
+                  item.participantLocationKey ? styles.pillTextMuted : styles.pillTextWarn,
+                ]}
+              >
+                {item.participantLocationKey
+                  ? formatLocationLabel(item.participantLocationKey, locationOptions)
+                  : 'No location'}
+              </Text>
+            </View>
+          </View>
         </View>
       </TouchableOpacity>
     ),
-    [navigation, area, isSelectionMode, selectedIds, toggleSelected]
+    [navigation, resolveArea, locationOptions, isSelectionMode, selectedIds, toggleSelected],
   );
 
   const renderFooter = () =>
@@ -421,26 +625,77 @@ export function ConversationListScreen({ route, navigation }: Props) {
       </View>
 
       <View style={styles.tabsRow}>
-        {FILTER_TABS.map((tab) => (
-          <TouchableOpacity
-            key={tab}
-            style={[styles.tab, activeFilter === tab && styles.tabActive]}
-            onPress={() => setActiveFilter(tab)}
-          >
-            <Text style={[styles.tabText, activeFilter === tab && styles.tabTextActive]}>
-              {tab}
-            </Text>
-            {tab === 'Labels' && (
-              <Ionicons name="chevron-down" size={14} color={colors.textMuted} style={styles.tabChevron} />
-            )}
-          </TouchableOpacity>
-        ))}
+        <View style={styles.tabsLeft}>
+          {FILTER_TABS.map((tab) => (
+            <TouchableOpacity
+              key={tab}
+              style={[styles.tab, activeFilter === tab && styles.tabActive]}
+              onPress={() => setActiveFilter(tab)}
+            >
+              <Text style={[styles.tabText, activeFilter === tab && styles.tabTextActive]}>
+                {tab}
+              </Text>
+              {tab === 'Labels' && (
+                <Ionicons
+                  name="chevron-down"
+                  size={14}
+                  color={colors.textMuted}
+                  style={styles.tabChevron}
+                />
+              )}
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        <Pressable
+          onPress={() => setShowLocationFilterModal(true)}
+          accessibilityRole="button"
+          accessibilityLabel="Filter by location"
+          style={({ pressed }) => [styles.locationFilterBtn, pressed && styles.locationFilterBtnPressed]}
+          hitSlop={8}
+        >
+          <Ionicons name="location-outline" size={16} color={colors.primary} />
+          <Text style={styles.locationFilterText}>
+            {adminQueue
+              ? 'Admin queue'
+              : locationFilter === 'all'
+                ? 'All my locations'
+                : formatLocationLabel(locationFilter, locationOptions)}
+          </Text>
+          <Ionicons name="chevron-down" size={14} color={colors.textMuted} />
+        </Pressable>
       </View>
+
+      {/* Admin queue toggle — only shown to full-access roles */}
+      {hasFullLocationAccess(tokenData?.role) && (
+        <TouchableOpacity
+          style={[styles.adminQueueRow, adminQueue && styles.adminQueueRowActive]}
+          activeOpacity={0.7}
+          onPress={() => {
+            setAdminQueue((prev) => !prev);
+            setLocationFilter('all');
+          }}
+        >
+          <Ionicons
+            name={adminQueue ? 'albums' : 'albums-outline'}
+            size={18}
+            color={adminQueue ? '#fff' : colors.textMuted}
+          />
+          <Text style={[styles.adminQueueText, adminQueue && styles.adminQueueTextActive]}>
+            Admin queue
+          </Text>
+          {adminQueue && (
+            <View style={styles.adminQueueBadge}>
+              <Text style={styles.adminQueueBadgeText}>ON</Text>
+            </View>
+          )}
+        </TouchableOpacity>
+      )}
 
       <TouchableOpacity
         style={styles.archivedRow}
         activeOpacity={0.7}
-        onPress={() => navigation.navigate('ArchiveList')}
+        onPress={() => navigation.navigate('ArchiveList', { defaultArea })}
       >
         <Ionicons name="archive-outline" size={22} color={colors.textMuted} />
         <Text style={styles.archivedText}>Archived</Text>
@@ -456,6 +711,76 @@ export function ConversationListScreen({ route, navigation }: Props) {
   return (
     <View style={styles.container}>
       <Modal
+        visible={Boolean(avatarPreviewUri)}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setAvatarPreviewUri(null)}
+      >
+        <TouchableWithoutFeedback onPress={() => setAvatarPreviewUri(null)}>
+          <View style={styles.avatarPreviewOverlay}>
+            <TouchableWithoutFeedback>
+              <View style={styles.avatarPreviewCard}>
+                <Pressable
+                  onPress={() => setAvatarPreviewUri(null)}
+                  style={styles.avatarPreviewClose}
+                  accessibilityRole="button"
+                  accessibilityLabel="Close photo"
+                  hitSlop={10}
+                >
+                  <Ionicons name="close" size={22} color="#fff" />
+                </Pressable>
+                {!!avatarPreviewUri && (
+                  <Image source={{ uri: avatarPreviewUri }} style={styles.avatarPreviewImage} />
+                )}
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
+      <Modal
+        visible={showLocationFilterModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowLocationFilterModal(false)}
+      >
+        <TouchableWithoutFeedback onPress={() => setShowLocationFilterModal(false)}>
+          <View style={styles.modalOverlay}>
+            <TouchableWithoutFeedback>
+              <View style={styles.pickerCard}>
+                <Text style={styles.pickerTitle}>Location</Text>
+                {locationFilterChoices.map((key) => (
+                  <Pressable
+                    key={key}
+                    onPress={() => {
+                      setLocationFilter(key);
+                      setShowLocationFilterModal(false);
+                    }}
+                    style={({ pressed }) => [
+                      styles.pickerRow,
+                      key === locationFilter && styles.pickerRowActive,
+                      pressed && styles.pickerRowPressed,
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Filter ${key === 'all' ? 'all locations' : formatLocationLabel(key, locationOptions)}`}
+                  >
+                    <Text style={styles.pickerRowText}>
+                      {key === 'all'
+                        ? 'All my locations'
+                        : formatLocationLabel(key, locationOptions)}
+                    </Text>
+                    {key === locationFilter && (
+                      <Ionicons name="checkmark" size={18} color={colors.primary} />
+                    )}
+                  </Pressable>
+                ))}
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
+      <Modal
         visible={showNewChatModal}
         transparent
         animationType="fade"
@@ -466,7 +791,93 @@ export function ConversationListScreen({ route, navigation }: Props) {
             <TouchableWithoutFeedback>
               <View style={styles.modalCard}>
                 <Text style={styles.modalTitle}>Start a new chat</Text>
-                <Text style={styles.modalSubtitle}>Enter country code and phone number</Text>
+                <Text style={styles.modalSubtitle}>Choose Owner/Guest, location, and phone number</Text>
+
+                <View style={styles.typeRow}>
+                  <Pressable
+                    onPress={() => setNewContactType('owner')}
+                    style={({ pressed }) => [
+                      styles.typePill,
+                      newContactType === 'owner' && styles.typePillActive,
+                      pressed && styles.typePillPressed,
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Add owner"
+                  >
+                    <Text
+                      style={[
+                        styles.typePillText,
+                        newContactType === 'owner' && styles.typePillTextActive,
+                      ]}
+                    >
+                      Owner
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => setNewContactType('guest')}
+                    style={({ pressed }) => [
+                      styles.typePill,
+                      newContactType === 'guest' && styles.typePillActive,
+                      pressed && styles.typePillPressed,
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Add guest"
+                  >
+                    <Text
+                      style={[
+                        styles.typePillText,
+                        newContactType === 'guest' && styles.typePillTextActive,
+                      ]}
+                    >
+                      Guest
+                    </Text>
+                  </Pressable>
+                </View>
+
+                <View style={styles.modalFieldFull}>
+                  <Text style={styles.modalLabel}>Name (optional)</Text>
+                  <TextInput
+                    style={styles.modalInput}
+                    value={newContactName}
+                    onChangeText={setNewContactName}
+                    placeholder={newContactType === 'guest' ? 'Guest name' : 'Owner name'}
+                    placeholderTextColor={colors.textMuted}
+                    autoCorrect={false}
+                    autoCapitalize="words"
+                  />
+                </View>
+
+                <View style={styles.locationRow}>
+                  <Text style={styles.modalLabel}>Location</Text>
+                  <View style={styles.locationChips}>
+                    {locationOptions.map((loc) => {
+                      const locKey = normalizeLocationKey(loc);
+                      return (
+                        <Pressable
+                          key={locKey}
+                          onPress={() => setNewContactLocation(locKey)}
+                          style={({ pressed }) => [
+                            styles.locationChip,
+                            newContactLocation === locKey && styles.locationChipActive,
+                            pressed && styles.locationChipPressed,
+                          ]}
+                          accessibilityRole="button"
+                          accessibilityLabel={`Set location ${loc}`}
+                        >
+                          <Ionicons name="location-outline" size={14} color={colors.textSecondary} />
+                          <Text
+                            style={[
+                              styles.locationChipText,
+                              newContactLocation === locKey && styles.locationChipTextActive,
+                            ]}
+                          >
+                            {loc}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </View>
 
                 <View style={styles.modalRow}>
                   <View style={styles.modalFieldSmall}>
@@ -587,7 +998,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
                             onPress={() => {
                               navigation.navigate('ConversationDetail', {
                                 conversationId: item.id,
-                                area,
+                                area: resolveArea(item),
                                 conversationName: item.name,
                                 participantPhone: item.phone,
                                 highlightMessageId: item.messageId,
@@ -598,15 +1009,25 @@ export function ConversationListScreen({ route, navigation }: Props) {
                             }}
                           >
                             <View style={styles.avatar}>
-                              <Text style={styles.avatarText} numberOfLines={1}>
-                                {getInitials(item.name)}
-                              </Text>
+                              {item.participantProfilePic ? (
+                                <Image source={{ uri: item.participantProfilePic }} style={styles.avatarImage} />
+                              ) : (
+                                <Text style={styles.avatarText} numberOfLines={1}>
+                                  {getInitials(item.name)}
+                                </Text>
+                              )}
                             </View>
                             <View style={styles.rowCenter}>
                               <View style={styles.rowTop}>
-                                <Text style={styles.name} numberOfLines={1}>
-                                  {item.name}
-                                </Text>
+                                <View style={styles.rowTopLeft}>
+                                  <Text style={styles.name} numberOfLines={1}>
+                                    {item.name}
+                                  </Text>
+                                  <GuestOutboundStatsBadges
+                                    conversation={item as Conversation}
+                                    variant="inline"
+                                  />
+                                </View>
                                 <Text style={styles.date}>
                                   {formatListDate(item.lastMessageAt)}
                                 </Text>
@@ -620,6 +1041,44 @@ export function ConversationListScreen({ route, navigation }: Props) {
                                     </Text>
                                   </View>
                                 )}
+                              </View>
+                              <View style={styles.metaRow}>
+                                {!!item.conversationType && (
+                                  <View
+                                    style={[
+                                      styles.typeBadgeInline,
+                                      item.conversationType === 'guest'
+                                        ? styles.typeBadgeInlineGuest
+                                        : styles.typeBadgeInlineOwner,
+                                    ]}
+                                  >
+                                    <Text style={styles.typeBadgeInlineText}>
+                                      {item.conversationType === 'guest' ? 'G' : 'O'}
+                                    </Text>
+                                  </View>
+                                )}
+                                <View
+                                  style={[
+                                    styles.pill,
+                                    item.participantLocationKey ? styles.pillLocation : styles.pillNoLocation,
+                                  ]}
+                                >
+                                  <Ionicons
+                                    name="location-outline"
+                                    size={12}
+                                    color={item.participantLocationKey ? colors.textSecondary : '#B45309'}
+                                  />
+                                  <Text
+                                    style={[
+                                      styles.pillText,
+                                      item.participantLocationKey ? styles.pillTextMuted : styles.pillTextWarn,
+                                    ]}
+                                  >
+                                    {item.participantLocationKey
+                                      ? formatLocationLabel(item.participantLocationKey, locationOptions)
+                                      : 'No location'}
+                                  </Text>
+                                </View>
                               </View>
                             </View>
                           </TouchableOpacity>
@@ -738,6 +1197,35 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 8,
     gap: 4,
+    justifyContent: 'space-between',
+  },
+  tabsLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    flex: 1,
+    minWidth: 0,
+  },
+  locationFilterBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.backgroundSecondary,
+    maxWidth: 190,
+  },
+  locationFilterBtnPressed: {
+    opacity: 0.85,
+  },
+  locationFilterText: {
+    flexShrink: 1,
+    fontSize: 13,
+    fontWeight: '600',
+    color: colors.text,
   },
   tab: {
     flexDirection: 'row',
@@ -759,6 +1247,39 @@ const styles = StyleSheet.create({
   },
   tabChevron: {
     marginLeft: 2,
+  },
+  adminQueueRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    gap: 12,
+    backgroundColor: colors.backgroundSecondary,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+  },
+  adminQueueRowActive: {
+    backgroundColor: '#128C7E',
+  },
+  adminQueueText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    flex: 1,
+  },
+  adminQueueTextActive: {
+    color: '#fff',
+    fontWeight: '600',
+  },
+  adminQueueBadge: {
+    backgroundColor: 'rgba(255,255,255,0.25)',
+    borderRadius: 8,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  adminQueueBadgeText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '700',
   },
   archivedRow: {
     flexDirection: 'row',
@@ -838,6 +1359,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 14,
+    overflow: 'hidden',
+  },
+  avatarImage: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    resizeMode: 'cover',
   },
   avatarText: {
     fontSize: 18,
@@ -866,6 +1394,28 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  typeBadgeInline: {
+    height: 22,
+    minWidth: 22,
+    paddingHorizontal: 6,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+  },
+  typeBadgeInlineOwner: {
+    backgroundColor: 'rgba(7, 94, 84, 0.10)',
+    borderColor: 'rgba(7, 94, 84, 0.24)',
+  },
+  typeBadgeInlineGuest: {
+    backgroundColor: 'rgba(37, 211, 102, 0.12)',
+    borderColor: 'rgba(37, 211, 102, 0.26)',
+  },
+  typeBadgeInlineText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: colors.textSecondary,
+  },
   rowCenter: {
     flex: 1,
     minWidth: 0,
@@ -875,12 +1425,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     marginBottom: 2,
+    gap: 8,
+  },
+  rowTopLeft: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    minWidth: 0,
   },
   name: {
     fontSize: 17,
     fontWeight: '600',
     color: colors.text,
-    flex: 1,
+    flexShrink: 1,
+    minWidth: 0,
   },
   date: {
     fontSize: 13,
@@ -891,6 +1449,41 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     minWidth: 0,
+  },
+  metaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 6,
+    flexWrap: 'wrap',
+  },
+  pill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  pillLocation: {
+    backgroundColor: colors.backgroundSecondary,
+    borderColor: colors.border,
+  },
+  pillNoLocation: {
+    backgroundColor: 'rgba(245, 158, 11, 0.12)',
+    borderColor: 'rgba(245, 158, 11, 0.22)',
+  },
+  pillText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textSecondary,
+  },
+  pillTextMuted: {
+    color: colors.textSecondary,
+  },
+  pillTextWarn: {
+    color: '#B45309',
   },
   lastMessage: {
     fontSize: 15,
@@ -926,10 +1519,107 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     justifyContent: 'center',
   },
+  pickerCard: {
+    backgroundColor: colors.background,
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  pickerTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: colors.text,
+    marginBottom: 8,
+  },
+  pickerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+  },
+  pickerRowActive: {
+    backgroundColor: 'rgba(7, 94, 84, 0.08)',
+  },
+  pickerRowPressed: {
+    opacity: 0.85,
+  },
+  pickerRowText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.text,
+  },
+  avatarPreviewOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.85)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+  },
+  avatarPreviewCard: {
+    width: '100%',
+    maxWidth: 420,
+    borderRadius: 18,
+    overflow: 'hidden',
+    backgroundColor: '#000',
+  },
+  avatarPreviewClose: {
+    position: 'absolute',
+    top: 10,
+    right: 10,
+    zIndex: 2,
+    height: 40,
+    width: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarPreviewImage: {
+    width: '100%',
+    aspectRatio: 1,
+    maxHeight: 420,
+    resizeMode: 'cover',
+  },
   modalCard: {
     backgroundColor: colors.background,
     borderRadius: 16,
     padding: 16,
+  },
+  typeRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 12,
+    marginBottom: 10,
+  },
+  typePill: {
+    flex: 1,
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.backgroundSecondary,
+    minHeight: 44,
+  },
+  typePillActive: {
+    backgroundColor: 'rgba(7, 94, 84, 0.10)',
+    borderColor: 'rgba(7, 94, 84, 0.24)',
+  },
+  typePillPressed: {
+    opacity: 0.85,
+  },
+  typePillText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: colors.textSecondary,
+  },
+  typePillTextActive: {
+    color: colors.text,
   },
   modalTitle: {
     fontSize: 18,
@@ -952,10 +1642,48 @@ const styles = StyleSheet.create({
   modalField: {
     flex: 1,
   },
+  modalFieldFull: {
+    marginTop: 10,
+  },
   modalLabel: {
     fontSize: 12,
     color: colors.textMuted,
     marginBottom: 6,
+  },
+  locationRow: {
+    marginTop: 12,
+  },
+  locationChips: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 8,
+  },
+  locationChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.backgroundSecondary,
+    minHeight: 36,
+  },
+  locationChipActive: {
+    backgroundColor: 'rgba(7, 94, 84, 0.10)',
+    borderColor: 'rgba(7, 94, 84, 0.24)',
+  },
+  locationChipPressed: {
+    opacity: 0.85,
+  },
+  locationChipText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: colors.textSecondary,
+  },
+  locationChipTextActive: {
+    color: colors.text,
   },
   modalInput: {
     backgroundColor: colors.backgroundSecondary,

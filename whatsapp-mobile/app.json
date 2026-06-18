@@ -1,45 +1,74 @@
 {
   "expo": {
-    "name": "whatsapp-mobile",
-    "slug": "whatsapp-mobile",
+    "name": "Adminstro",
+    "slug": "adminstro",
     "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "orientation": "default",
+    "icon": "./assets/adminstro.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/adminstro.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "notification": {
-      "icon": "./assets/icon.png",
-      "color": "#111827"
+      "icon": "./assets/adminstro.png",
+      "color": "#25D366",
+      "androidMode": "default",
+      "androidCollapsedTitle": "#{unread_notifications} new messages"
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.zaidzz4.whatsappmobile"
+      "bundleIdentifier": "com.zaidzz4.whatsappmobile",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Microphone access is required for WhatsApp voice calls.",
+        "UIBackgroundModes": ["remote-notification", "fetch", "audio"]
+      }
     },
     "android": {
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.CAMERA",
+        "android.permission.INTERNET",
+        "android.permission.WAKE_LOCK",
+        "android.permission.PROXIMITY_WAKE_LOCK",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.VIBRATE",
+        "android.permission.USE_FULL_SCREEN_INTENT"
+      ],
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/adminstro.png",
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "softwareKeyboardLayoutMode": "pan",
-      "package": "com.zaidzz4.whatsappmobile"
+      "package": "com.zaidzz4.whatsappmobile",
+      "googleServicesFile": "./google-services.json"
     },
     "plugins": [
+      "expo-dev-client",
+      "@config-plugins/react-native-webrtc",
       [
         "expo-notifications",
         {
+          "icon": "./assets/adminstro.png",
+          "color": "#25D366",
+          "defaultChannel": "whatsapp-messages",
+          "sounds": [],
           "useNextNotificationsApi": true
         }
       ]
     ],
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/adminstro.png"
     },
     "extra": {
       "eas": {

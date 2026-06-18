@@ -9,6 +9,14 @@ export const API_CONFIG = {
   TIMEOUT_MS: 15000,
 } as const;
 
+export const TRANSLATE_CONFIG = {
+  // Optional LibreTranslate-compatible endpoint (POST { q, source, target, format }).
+  // If omitted, the app falls back to MyMemory (no key, public).
+  URL: process.env.EXPO_PUBLIC_TRANSLATE_URL,
+  MYMEMORY_URL: 'https://api.mymemory.translated.net/get',
+  TIMEOUT_MS: 15000,
+} as const;
+
 export const SOCKET_CONFIG = {
   // Prefer explicit override; otherwise derive from API base (strip trailing "/api").
   URL:

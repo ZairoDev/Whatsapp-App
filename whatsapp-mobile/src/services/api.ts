@@ -22,6 +22,9 @@ const api: AxiosInstance = axios.create({
   timeout: API_CONFIG.TIMEOUT_MS,
   headers: {
     'Content-Type': 'application/json',
+    // Tell the backend this is a mobile client so it always uses mobileSession
+    // for auth checks (heartbeat, no expiry) instead of webSession.
+    'x-device-type': 'mobile',
   },
 });
 
@@ -70,6 +73,11 @@ api.interceptors.response.use(
       const netError = new Error(`Network error — please check your internet connection.${reason}`);
       (netError as any).isNetworkError = true;
       return Promise.reject(netError);
+    }
+
+    // Surface server error text on the Error object so callers can use e.message.
+    if (serverMsg) {
+      error.message = serverMsg;
     }
 
     // Only clear auth state when we are confident the employee session is invalid.

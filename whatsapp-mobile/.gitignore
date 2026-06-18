@@ -34,8 +34,9 @@ yarn-error.*
 .env
 .env*.local
 
-# Firebase config (if added for push credentials)
-google-services.json
+# Firebase service account keys (sensitive — never commit)
+*-firebase-adminsdk-*.json
+vacationsaga-*.json
 GoogleService-Info.plist
 
 # typescript

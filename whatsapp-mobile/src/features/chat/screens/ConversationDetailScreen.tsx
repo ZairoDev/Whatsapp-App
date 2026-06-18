@@ -1,11 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   Image,
   KeyboardAvoidingView,
   Modal,
   Platform,
+  Pressable,
+  useColorScheme,
   StyleSheet,
   Text,
   TextInput,
@@ -13,18 +16,22 @@ import {
   TouchableWithoutFeedback,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { ResizeMode, Video } from 'expo-av';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Audio, ResizeMode, Video } from 'expo-av';
+import * as Clipboard from 'expo-clipboard';
 import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import {
   fetchConversationMessages,
   fetchConversationReaders,
+  forwardMessages,
   markConversationRead,
   searchConversations,
   sendMessage,
   sendReaction,
 } from '../services';
+import { useWhatsAppCall } from '../hooks/useWhatsAppCall';
+import { CallOverlay } from '../components/CallOverlay';
 import type { ConversationReader } from '../services';
 import { MessageComposer } from '../components';
 import type { Conversation, Message } from '../types';
@@ -32,6 +39,7 @@ import type { ChatAppStackParamList } from '../../../core/navigation/ChatAppStac
 import { colors } from '../../../theme/colors';
 import { useChatStore } from '../chat.store';
 import { joinConversationRoom, leaveConversationRoom } from '../../../services/socket';
+import { translateToEnglish } from '../../../services/translate';
 
 type Props = NativeStackScreenProps<ChatAppStackParamList, 'ConversationDetail'>;
 
@@ -52,6 +60,13 @@ function formatTime(ts?: number): string {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+function formatMmSs(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const mm = String(Math.floor(totalSec / 60)).padStart(2, '0');
+  const ss = String(totalSec % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
 }
 
 /** Same semantics as MessageComposer — remaining time until template-only. */
@@ -95,6 +110,26 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     isDraft = false,
   } = route.params;
 
+  const insets = useSafeAreaInsets();
+  const isDark = useColorScheme() === 'dark';
+  const ui = useMemo(
+    () => ({
+      bg: isDark ? '#0B141A' : '#EFEAE2',
+      headerBg: isDark ? '#111B21' : colors.backgroundSecondary,
+      headerBorder: isDark ? 'rgba(255,255,255,0.10)' : colors.border,
+      text: isDark ? '#E9EDEF' : colors.text,
+      textMuted: isDark ? 'rgba(233,237,239,0.72)' : colors.textMuted,
+      inBubble: isDark ? '#1F2C34' : colors.chatBubbleIn,
+      outBubble: isDark ? '#005C4B' : colors.chatBubbleOut,
+      bubbleMeta: isDark ? 'rgba(233,237,239,0.65)' : colors.textMuted,
+      dateChipBg: isDark ? 'rgba(17,27,33,0.85)' : 'rgba(225,228,234,0.92)',
+      dateChipText: isDark ? 'rgba(233,237,239,0.78)' : colors.textSecondary,
+      reactionChipBg: isDark ? '#1F2C34' : '#FFF',
+      reactionChipBorder: isDark ? 'rgba(255,255,255,0.10)' : colors.border,
+    }),
+    [isDark]
+  );
+
   // Self-chat ("You") always sends directly — never template-only.
   const templateOnly = isSelf ? false : templateOnlyParam;
   const conversationStarted = Boolean(windowExpiresAt);
@@ -104,6 +139,38 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   const messagesFromStore = useChatStore((s) => s.messages[conversationId]);
   const messages = messagesFromStore ?? EMPTY_MESSAGES;
   const setMessagesInStore = useChatStore((s) => s.setMessages);
+
+  // ---- audio playback (voice notes) ----
+  const soundRef = useRef<Audio.Sound | null>(null);
+  const audioTrackWidthsRef = useRef<Record<string, number>>({});
+  const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
+  const [audioStatus, setAudioStatus] = useState<{
+    isPlaying: boolean;
+    positionMillis: number;
+    durationMillis: number;
+  }>({ isPlaying: false, positionMillis: 0, durationMillis: 0 });
+
+  const stopAudio = useCallback(async () => {
+    try {
+      const s = soundRef.current;
+      if (s) {
+        await s.stopAsync();
+        await s.unloadAsync();
+      }
+    } catch {
+      // ignore
+    } finally {
+      soundRef.current = null;
+      setPlayingMessageId(null);
+      setAudioStatus({ isPlaying: false, positionMillis: 0, durationMillis: 0 });
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopAudio().catch(() => {});
+    };
+  }, [stopAudio]);
   const updateMessageStatus = useChatStore((s) => s.updateMessageStatus);
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const [loading, setLoading] = useState(true);
@@ -126,6 +193,7 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   const [readers, setReaders] = useState<ConversationReader[]>([]);
   const [readersLoading, setReadersLoading] = useState(false);
   const [showReadersPopover, setShowReadersPopover] = useState(false);
+  const [showHeaderMenu, setShowHeaderMenu] = useState(false);
   const [reactionTarget, setReactionTarget] = useState<Message | null>(null);
   const [reactionSending, setReactionSending] = useState(false);
   const [replyTarget, setReplyTarget] = useState<Message | null>(null);
@@ -135,6 +203,59 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   const [forwardError, setForwardError] = useState<string | null>(null);
   const [remainingMs, setRemainingMs] = useState(() =>
     windowExpiresAt ? Math.max(0, windowExpiresAt - Date.now()) : 0
+  );
+
+  const [translatedByKey, setTranslatedByKey] = useState<Record<string, string>>({});
+  const [translatingKeys, setTranslatingKeys] = useState<Set<string>>(new Set());
+  const translatingKeysRef = useRef<Set<string>>(new Set());
+  const [showTranslatedKeys, setShowTranslatedKeys] = useState<Set<string>>(new Set());
+
+  const toggleTranslateForMessage = useCallback(
+    async (message: Message) => {
+      const messageKey = message.whatsappMessageId ?? message.id;
+      const rawText = (message.displayText || message.content || '').trim();
+
+      if (!messageKey || !rawText) return;
+      if (message.type !== 'text' || message.direction !== 'incoming') return;
+
+      // Toggle off if currently showing translated text
+      if (showTranslatedKeys.has(messageKey)) {
+        setShowTranslatedKeys((prev) => {
+          const next = new Set(prev);
+          next.delete(messageKey);
+          return next;
+        });
+        return;
+      }
+
+      // Toggle on: if we already have a translation, just show it.
+      const existingTranslation = translatedByKey[messageKey];
+      if (existingTranslation) {
+        setShowTranslatedKeys((prev) => new Set(prev).add(messageKey));
+        return;
+      }
+
+      // Otherwise fetch translation, then show it.
+      if (translatingKeysRef.current.has(messageKey)) return;
+      translatingKeysRef.current.add(messageKey);
+      setTranslatingKeys((prev) => new Set(prev).add(messageKey));
+      try {
+        const translated = await translateToEnglish(rawText);
+        setTranslatedByKey((prev) => ({ ...prev, [messageKey]: translated }));
+        setShowTranslatedKeys((prev) => new Set(prev).add(messageKey));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unknown error';
+        Alert.alert('Translate failed', msg);
+      } finally {
+        translatingKeysRef.current.delete(messageKey);
+        setTranslatingKeys((prev) => {
+          const next = new Set(prev);
+          next.delete(messageKey);
+          return next;
+        });
+      }
+    },
+    [showTranslatedKeys, translatedByKey]
   );
 
   useEffect(() => {
@@ -288,7 +409,7 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   const handleDraftMessageSent = useCallback(async () => {
     if (!isDraft || !participantPhone?.trim()) return;
     try {
-      const results = await searchConversations(area, participantPhone);
+      const results = await searchConversations(participantPhone);
       if (!results.length) return;
       const hit = results[0];
       navigation.replace('ConversationDetail', {
@@ -382,6 +503,80 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     };
   }, [messages, pendingHighlight, hasMore, loadingOlder, loadOlder]);
 
+  const toggleAudioPlayback = useCallback(
+    async (messageId: string, uri: string) => {
+      if (!uri) return;
+
+      // Same message: toggle play/pause
+      if (playingMessageId === messageId && soundRef.current) {
+        try {
+          const status = await soundRef.current.getStatusAsync();
+          if ('isPlaying' in status && status.isPlaying) {
+            await soundRef.current.pauseAsync();
+            setAudioStatus((s) => ({ ...s, isPlaying: false }));
+          } else {
+            await soundRef.current.playAsync();
+            setAudioStatus((s) => ({ ...s, isPlaying: true }));
+          }
+        } catch {
+          await stopAudio();
+        }
+        return;
+      }
+
+      // Different message: stop previous and start new
+      await stopAudio();
+      try {
+        await Audio.setAudioModeAsync({
+          playsInSilentModeIOS: true,
+          staysActiveInBackground: false,
+          shouldDuckAndroid: true,
+          playThroughEarpieceAndroid: false,
+        });
+
+        const safeUri = encodeURI(uri);
+        const { sound } = await Audio.Sound.createAsync(
+          { uri: safeUri },
+          { shouldPlay: true },
+          (status) => {
+            if (!status || !('isLoaded' in status) || !status.isLoaded) return;
+            setAudioStatus({
+              isPlaying: Boolean(status.isPlaying),
+              positionMillis: typeof status.positionMillis === 'number' ? status.positionMillis : 0,
+              durationMillis: typeof status.durationMillis === 'number' ? status.durationMillis : 0,
+            });
+            if (status.didJustFinish) {
+              // release resources when finished
+              stopAudio().catch(() => {});
+            }
+          }
+        );
+        soundRef.current = sound;
+        setPlayingMessageId(messageId);
+      } catch {
+        await stopAudio();
+      }
+    },
+    [playingMessageId, stopAudio]
+  );
+
+  const seekAudio = useCallback(
+    async (messageId: string, ratio: number) => {
+      if (playingMessageId !== messageId) return;
+      const s = soundRef.current;
+      if (!s) return;
+      const dur = audioStatus.durationMillis;
+      if (!dur || dur <= 0) return;
+      const clamped = Math.max(0, Math.min(1, ratio));
+      try {
+        await s.setPositionAsync(Math.floor(dur * clamped));
+      } catch {
+        // ignore
+      }
+    },
+    [audioStatus.durationMillis, playingMessageId]
+  );
+
   const renderMessage = ({
     item,
     index,
@@ -395,6 +590,20 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     }
     const isOut = item.direction === 'outgoing';
     const isHighlighted = highlightedMessageId != null && item.id === highlightedMessageId;
+    const messageKey = item.whatsappMessageId ?? item.id;
+    const rawText = (item.displayText || item.content || '').trim();
+    const translatedText = messageKey ? translatedByKey[messageKey] : undefined;
+    const isTranslating = Boolean(messageKey && translatingKeys.has(messageKey));
+    const canTranslate =
+      item.type === 'text' &&
+      item.direction === 'incoming' &&
+      Boolean(rawText) &&
+      Boolean(messageKey);
+    const isShowingTranslated = Boolean(messageKey && showTranslatedKeys.has(messageKey));
+    const displayText =
+      isShowingTranslated && translatedText
+        ? translatedText
+        : rawText;
     // FlatList is inverted: index 0 = newest (bottom), higher index = older (top).
     // The date chip must sit above the oldest message of each day group, so we
     // compare against the OLDER neighbor (index + 1), not the newer one (index - 1).
@@ -471,21 +680,63 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
             </Text>
           </View>
         )}
-        <TouchableOpacity
-          activeOpacity={0.9}
+        <Pressable
           onLongPress={() => setReactionTarget(item)}
-          style={[
+          delayLongPress={250}
+          android_ripple={{ color: 'rgba(0,0,0,0.08)' }}
+          style={({ pressed }) => [
             styles.bubbleWrap,
             isOut ? styles.bubbleWrapOut : styles.bubbleWrapIn,
+            pressed && styles.bubbleWrapPressed,
           ]}
+          accessibilityRole="button"
+          accessibilityLabel="Message"
         >
           <View
             style={[
               styles.bubble,
-              isOut ? styles.bubbleOut : styles.bubbleIn,
+              { backgroundColor: isOut ? ui.outBubble : ui.inBubble },
+              !isOut && styles.bubbleInBorder,
+              isOut ? styles.bubbleOutTail : styles.bubbleInTail,
               isHighlighted && styles.bubbleHighlight,
+              item.isInternal && styles.bubbleInternal,
             ]}
           >
+            {/* Forwarded badge */}
+            {item.isForwarded && (
+              <View style={styles.forwardedBadge}>
+                <Ionicons name="arrow-redo-outline" size={12} color={ui.bubbleMeta} />
+                <Text style={[styles.forwardedBadgeText, { color: ui.bubbleMeta }]}>Forwarded</Text>
+              </View>
+            )}
+            {/* Internal note badge */}
+            {item.isInternal && (
+              <View style={styles.internalBadge}>
+                <Ionicons name="lock-closed-outline" size={11} color="#92680A" />
+                <Text style={styles.internalBadgeText}>Internal note</Text>
+              </View>
+            )}
+            {/* Reply context (quoted message) */}
+            {!!item.replyContext && (
+              <View style={[styles.replyContextBox, isOut ? styles.replyContextBoxOut : styles.replyContextBoxIn]}>
+                <View style={styles.replyContextAccent} />
+                <View style={styles.replyContextBody}>
+                  {item.replyContext.content?.text ? (
+                    <Text style={[styles.replyContextText, { color: ui.textMuted }]} numberOfLines={2}>
+                      {item.replyContext.content.text}
+                    </Text>
+                  ) : item.replyContext.content?.caption ? (
+                    <Text style={[styles.replyContextText, { color: ui.textMuted }]} numberOfLines={2}>
+                      {item.replyContext.content.caption}
+                    </Text>
+                  ) : (
+                    <Text style={[styles.replyContextText, { color: ui.textMuted }]}>
+                      {item.replyContext.type !== 'text' ? `📎 ${item.replyContext.type}` : 'Message'}
+                    </Text>
+                  )}
+                </View>
+              </View>
+            )}
             {mediaGroup ? (
               <View style={styles.bubbleMediaColumn}>
                 <View style={styles.mediaGrid}>
@@ -537,7 +788,7 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                   })}
                 </View>
                 <View style={styles.bubbleMetaRow}>
-                  <Text style={styles.bubbleTime}>
+                  <Text style={[styles.bubbleTime, { color: ui.bubbleMeta }]}>
                     {formatTime(mediaGroup[mediaGroup.length - 1].timestamp)}
                   </Text>
                   {statusIcon && (
@@ -550,6 +801,106 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                   )}
                 </View>
               </View>
+            ) : item.type === 'audio' && item.mediaUrl ? (
+              (() => {
+                const isPlaying = playingMessageId === item.id && audioStatus.isPlaying;
+                const pct =
+                  playingMessageId === item.id && audioStatus.durationMillis > 0
+                    ? Math.min(1, Math.max(0, audioStatus.positionMillis / audioStatus.durationMillis))
+                    : 0;
+                const BAR_COUNT = 30;
+                const activeBars = Math.round(BAR_COUNT * pct);
+                const WAVE_HEIGHTS = [4,7,11,6,9,5,13,7,10,4,12,6,9,5,13,7,10,4,11,6,9,5,12,7,10,4,8,6,11,5];
+                const activeColor = isOut ? 'rgba(255,255,255,0.95)' : '#53BDEB';
+                const idleColor   = isOut ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.35)';
+                const curTime = playingMessageId === item.id
+                  ? formatMmSs(audioStatus.positionMillis)
+                  : '0:00';
+                return (
+                  <View style={styles.audioMsgWrap}>
+                    {/* Left: avatar/mic circle */}
+                    {isOut ? (
+                      <View style={[styles.audioCircle, { backgroundColor: 'rgba(0,0,0,0.20)' }]}>
+                        <Ionicons name="mic" size={18} color="rgba(255,255,255,0.90)" />
+                      </View>
+                    ) : headerAvatarUri ? (
+                      <Image source={{ uri: headerAvatarUri }} style={styles.audioCircle} />
+                    ) : (
+                      <View style={[styles.audioCircle, { backgroundColor: '#E9C46A' }]}>
+                        <Ionicons name="person" size={18} color="#fff" />
+                      </View>
+                    )}
+
+                    {/* Middle: play + waveform + meta */}
+                    <View style={styles.audioBody}>
+
+                      {/* Top row: play btn + waveform */}
+                      <View style={styles.audioTopRow}>
+                        <TouchableOpacity
+                          activeOpacity={0.75}
+                          style={[styles.audioPlayCircle, { backgroundColor: isOut ? 'rgba(0,0,0,0.22)' : 'rgba(255,255,255,0.22)' }]}
+                          onPress={() => toggleAudioPlayback(item.id, item.mediaUrl || '')}
+                          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                          accessibilityRole="button"
+                          accessibilityLabel={isPlaying ? 'Pause voice message' : 'Play voice message'}
+                        >
+                          <Ionicons
+                            name={isPlaying ? 'pause' : 'play'}
+                            size={20}
+                            color="#fff"
+                            style={isPlaying ? undefined : { marginLeft: 2 }}
+                          />
+                        </TouchableOpacity>
+
+                        {/* Waveform scrubber */}
+                        <Pressable
+                          style={styles.audioWaveWrap}
+                          onLayout={(e) => { audioTrackWidthsRef.current[item.id] = e.nativeEvent.layout.width; }}
+                          onPress={(e) => {
+                            const w = audioTrackWidthsRef.current[item.id] ?? 1;
+                            seekAudio(item.id, e.nativeEvent.locationX / Math.max(1, w));
+                          }}
+                          accessibilityRole="adjustable"
+                          accessibilityLabel="Scrub voice message"
+                        >
+                          {WAVE_HEIGHTS.map((h, idx) => (
+                            <View
+                              key={idx}
+                              style={[
+                                styles.audioBar,
+                                {
+                                  height: h,
+                                  backgroundColor: idx < activeBars ? activeColor : idleColor,
+                                  borderRadius: 2,
+                                },
+                              ]}
+                            />
+                          ))}
+                        </Pressable>
+                      </View>
+
+                      {/* Bottom row: elapsed time  |  timestamp + tick */}
+                      <View style={styles.audioMetaRow}>
+                        <Text style={[styles.audioElapsed, { color: ui.textMuted }]}>{curTime}</Text>
+                        <View style={styles.audioMetaRight}>
+                          <Text style={[styles.audioTs, { color: ui.bubbleMeta }]}>
+                            {formatTime(item.timestamp)}
+                          </Text>
+                          {statusIcon && (
+                            <Ionicons
+                              name={statusIcon.name as any}
+                              size={statusIcon.isAlert ? 14 : 13}
+                              color={statusIcon.color}
+                              style={{ marginLeft: 3 }}
+                            />
+                          )}
+                        </View>
+                      </View>
+
+                    </View>
+                  </View>
+                );
+              })()
             ) : (item.type === 'image' || item.type === 'video') && (item.mediaUrl || item.thumbnailUrl) ? (
               <View style={styles.bubbleMediaColumn}>
                 {/* Small label above the preview with name/number */}
@@ -610,11 +961,58 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                   </TouchableOpacity>
                 )}
               </View>
+            ) : item.type === 'document' ? (
+              <View style={styles.documentBubble}>
+                <View style={styles.documentIconWrap}>
+                  <Ionicons name="document-attach-outline" size={28} color={isOut ? 'rgba(255,255,255,0.9)' : colors.primary} />
+                </View>
+                <View style={styles.documentInfo}>
+                  <Text style={[styles.documentFilename, { color: ui.text }]} numberOfLines={2}>
+                    {item.filename || item.displayText || 'Document'}
+                  </Text>
+                  {!!item.mediaUrl && (
+                    <Text style={[styles.documentDownload, { color: isOut ? 'rgba(255,255,255,0.75)' : colors.primary }]}>
+                      Tap to open
+                    </Text>
+                  )}
+                </View>
+                <View style={[styles.bubbleMetaRow, { position: 'relative', right: 0, bottom: 0, marginTop: 4 }]}>
+                  <Text style={[styles.bubbleTime, { color: ui.bubbleMeta }]}>{formatTime(item.timestamp)}</Text>
+                  {statusIcon && (
+                    <Ionicons name={statusIcon.name as any} size={statusIcon.isAlert ? 15 : 14} color={statusIcon.color} style={styles.bubbleStatusIcon} />
+                  )}
+                </View>
+              </View>
+            ) : item.type === 'location' && item.location ? (
+              <View style={styles.locationBubble}>
+                <View style={styles.locationIconRow}>
+                  <Ionicons name="location-outline" size={20} color={isOut ? 'rgba(255,255,255,0.9)' : colors.primary} />
+                  <Text style={[styles.locationTitle, { color: ui.text }]}>
+                    {item.location.name || 'Location'}
+                  </Text>
+                </View>
+                {!!item.location.address && (
+                  <Text style={[styles.locationAddress, { color: ui.textMuted }]} numberOfLines={2}>
+                    {item.location.address}
+                  </Text>
+                )}
+                <Text style={[styles.locationCoords, { color: ui.textMuted }]}>
+                  {item.location.latitude.toFixed(5)}, {item.location.longitude.toFixed(5)}
+                </Text>
+                <View style={[styles.bubbleMetaRow, { position: 'relative', right: 0, bottom: 0, marginTop: 4 }]}>
+                  <Text style={[styles.bubbleTime, { color: ui.bubbleMeta }]}>{formatTime(item.timestamp)}</Text>
+                  {statusIcon && (
+                    <Ionicons name={statusIcon.name as any} size={statusIcon.isAlert ? 15 : 14} color={statusIcon.color} style={styles.bubbleStatusIcon} />
+                  )}
+                </View>
+              </View>
             ) : (
               <>
-                <Text style={styles.bubbleText}>{item.displayText || item.content}</Text>
+                <Text style={[styles.bubbleText, { color: ui.text }]}>{displayText}</Text>
                 <View style={styles.bubbleMetaRow}>
-                  <Text style={styles.bubbleTime}>{formatTime(item.timestamp)}</Text>
+                  <Text style={[styles.bubbleTime, { color: ui.bubbleMeta }]}>
+                    {formatTime(item.timestamp)}
+                  </Text>
                   {statusIcon && (
                     <Ionicons
                       name={statusIcon.name as any}
@@ -635,7 +1033,13 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
               ]}
             >
               {item.reactions.map((r) => (
-                <View key={r.emoji} style={styles.reactionChip}>
+                <View
+                  key={r.emoji}
+                  style={[
+                    styles.reactionChip,
+                    { backgroundColor: ui.reactionChipBg, borderColor: ui.reactionChipBorder },
+                  ]}
+                >
                   <Text style={styles.reactionChipText}>{r.emoji}</Text>
                   {r.count > 1 && (
                     <Text style={styles.reactionChipCount}>{r.count}</Text>
@@ -644,7 +1048,7 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
               ))}
             </View>
           )}
-        </TouchableOpacity>
+        </Pressable>
       </View>
     );
   };
@@ -659,6 +1063,68 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   const latestTimestamp = messages.length ? messages[messages.length - 1].timestamp : undefined;
 
   const allConversations = useChatStore((s) => s.conversations) as Conversation[];
+  const conversationFromStore = useMemo(
+    () => allConversations.find((c) => c.id === conversationId),
+    [allConversations, conversationId]
+  );
+  const headerAvatarUri = useMemo(() => {
+    const uri = conversationFromStore?.participantProfilePic ?? conversationFromStore?.avatar;
+    return typeof uri === 'string' && uri.trim() ? uri.trim() : '';
+  }, [conversationFromStore?.participantProfilePic, conversationFromStore?.avatar]);
+
+  const headerTitle = useMemo(() => {
+    const t = (conversationName ?? conversationFromStore?.name ?? '').toString().trim();
+    return t || 'Chat';
+  }, [conversationName, conversationFromStore?.name]);
+
+  const headerPhoneDigits = useMemo(() => {
+    const raw =
+      participantPhone ??
+      conversationFromStore?.phone ??
+      (headerTitle && /^\+?\d[\d\s-]+$/.test(headerTitle) ? headerTitle : '');
+    const digits = (raw ?? '').replace(/[^\d]/g, '').trim();
+    return digits ? `+${digits}` : '';
+  }, [participantPhone, conversationFromStore?.phone, headerTitle]);
+
+  const headerSubtitle = useMemo(() => {
+    // If we have a real name, show the phone below it. If title is already the phone, no subtitle.
+    const titleLooksLikePhone = /^\+?\d[\d\s-]+$/.test(headerTitle);
+    if (titleLooksLikePhone) return '';
+    return headerPhoneDigits;
+  }, [headerTitle, headerPhoneDigits]);
+  const participantWaId = useMemo(() => {
+    const fromRoute = participantPhone?.replace(/[^\d]/g, '').trim();
+    if (fromRoute) return fromRoute;
+    const conv = allConversations.find((c) => c.id === conversationId);
+    return conv?.phone?.replace(/[^\d]/g, '').trim() ?? '';
+  }, [participantPhone, allConversations, conversationId]);
+  const canInitiateCall = !isSelf && !isDraft && Boolean(participantWaId);
+
+  const {
+    phase: callPhase,
+    error: callError,
+    inCall,
+    startCall,
+    endCall,
+  } = useWhatsAppCall({
+    area,
+    conversationId,
+    participantWaId,
+    conversationName,
+    enabled: canInitiateCall,
+  });
+
+  const callBusy = callPhase !== 'idle' && callPhase !== 'error';
+
+  const handleCallPress = useCallback(async () => {
+    if (!canInitiateCall || callBusy) return;
+    try {
+      await startCall();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to start call';
+      Alert.alert('Call failed', msg);
+    }
+  }, [canInitiateCall, callBusy, startCall]);
   const forwardCandidates = useMemo(() => {
     const q = forwardQuery.trim().toLowerCase();
     const list = (allConversations ?? []).filter((c) => c.id && c.id !== conversationId);
@@ -681,22 +1147,30 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     return 'Message';
   }, [replyTarget]);
 
+  const reactionCopyText = useMemo(() => {
+    if (!reactionTarget) return '';
+    return (reactionTarget.displayText || reactionTarget.content || '').trim();
+  }, [reactionTarget]);
+
   const handleForwardTo = useCallback(
     async (target: Conversation) => {
       if (!forwardTarget) return;
       if (!target?.id) return;
-      const raw =
-        forwardTarget.type === 'text'
-          ? (forwardTarget.content || forwardTarget.displayText || '').trim()
-          : '';
-      if (!raw) {
-        setForwardError('Forwarding is currently supported for text messages only.');
+      // Use the Mongo _id to forward via the /whatsapp/forward-message API.
+      // This correctly forwards text AND media (image/video/document/audio) messages.
+      const mongoId = forwardTarget.id;
+      if (!mongoId || !/^[a-fA-F0-9]{24}$/.test(mongoId)) {
+        setForwardError('Cannot forward this message (no server ID).');
         return;
       }
       setForwardError(null);
       setForwardSending(true);
       try {
-        await sendMessage(target.id, target.phone ?? '', raw, 'text', area);
+        const result = await forwardMessages([mongoId], [target.id]);
+        if (result.errors?.length && !result.results.length) {
+          setForwardError(result.errors[0]?.error ?? 'Failed to forward message');
+          return;
+        }
         setForwardTarget(null);
         setForwardQuery('');
       } catch (e) {
@@ -711,17 +1185,18 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   // Optimistic message helpers ---------------------------------------------------
   // Add a bubble immediately with status='sending'. Returns a stable temp id.
   const handleOptimisticAdd = useCallback(
-    (content: string): string => {
+    (content: string, type?: Message['type'], mediaUrl?: string): string => {
       const tempId = `temp-${Date.now()}-${Math.random()}`;
       const optimistic: Message = {
         id: tempId,
         conversationId,
         content,
         displayText: content,
-        type: 'text',
+        type: type ?? 'text',
         direction: 'outgoing',
         timestamp: Date.now(),
         status: 'sending',
+        ...(mediaUrl ? { mediaUrl } : {}),
       };
       // Read current messages from store at call-time (not from closure) to avoid
       // adding `messages` to deps which would recreate this cb on every new message.
@@ -743,97 +1218,135 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
 
   return (
     <KeyboardAvoidingView
-      style={styles.container}
+      style={[styles.container, { backgroundColor: ui.bg }]}
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={0}
     >
-      <View style={styles.header}>
-        <SafeAreaView edges={['top']} style={styles.headerSafe}>
+      <View
+        style={[
+          styles.header,
+          { backgroundColor: ui.headerBg, borderBottomColor: ui.headerBorder },
+        ]}
+      >
+        <SafeAreaView
+          edges={['top']}
+          style={[styles.headerSafe, { paddingTop: Math.max(6, insets.top ? 4 : 6) }]}
+        >
           <View style={styles.headerLeft}>
-            <TouchableOpacity
+            <Pressable
               onPress={() => navigation.goBack()}
-              style={styles.backBtn}
-              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+              style={({ pressed }) => [styles.iconBtn, pressed && styles.iconBtnPressed]}
+              android_ripple={{ color: 'rgba(255,255,255,0.10)' }}
+              accessibilityRole="button"
+              accessibilityLabel="Back"
             >
-              <Ionicons name="chevron-back" size={24} color={colors.text} />
-            </TouchableOpacity>
+              <Ionicons name="chevron-back" size={24} color={ui.text} />
+            </Pressable>
             <View style={styles.avatar}>
-              <Text style={styles.avatarText}>{getInitials(conversationName)}</Text>
+              {headerAvatarUri ? (
+                <Image source={{ uri: headerAvatarUri }} style={styles.avatarImage} />
+              ) : (
+                <Text style={[styles.avatarText, { color: ui.textMuted }]}>
+                  {getInitials(headerTitle)}
+                </Text>
+              )}
             </View>
             <View style={styles.headerTextBlock}>
-              <Text style={styles.headerTitle} numberOfLines={1}>
-                {conversationName || 'Chat'}
+              <Text style={[styles.headerTitle, { color: ui.text }]} numberOfLines={1}>
+                {headerTitle}
               </Text>
-              <Text style={styles.headerSubtitle} numberOfLines={1}>
-                {conversationId}
-              </Text>
+              {!!headerSubtitle && (
+                <Text style={[styles.headerSubtitle, { color: ui.textMuted }]} numberOfLines={1}>
+                  {headerSubtitle}
+                </Text>
+              )}
             </View>
           </View>
           <View style={styles.headerRight}>
-            {headerShowCountdown && (
-              <View
-                style={[
-                  styles.templatePill,
-                  { backgroundColor: countdownAccent.bg },
-                ]}
-              >
-                <Text style={[styles.templatePillText, { color: countdownAccent.fg }]}>
-                  {formatCountdown(remainingMs)}
-                </Text>
-              </View>
-            )}
             {headerShowTemplateOnly && (
               <View style={styles.templatePill}>
                 <Text style={styles.templatePillText}>Template only</Text>
               </View>
             )}
-            {readers.length > 0 && (
-              <TouchableOpacity
-                activeOpacity={0.8}
-                onPress={() => setShowReadersPopover(true)}
-                style={styles.readersContainer}
+            {canInitiateCall && (
+              <Pressable
+                onPress={handleCallPress}
+                disabled={callBusy}
+                style={({ pressed }) => [
+                  styles.iconBtn,
+                  (pressed || callBusy) && styles.iconBtnPressed,
+                ]}
+                android_ripple={{ color: 'rgba(255,255,255,0.10)' }}
+                accessibilityRole="button"
+                accessibilityLabel="Call"
               >
-                <View style={styles.readersAvatarStack}>
-                  {readers.slice(0, 3).map((r, idx) => {
-                    const initials = getInitials(r.name);
-                    return (
-                      <View
-                        key={r.userId ?? `${idx}`}
-                        style={[
-                          styles.readerAvatar,
-                          idx > 0 && styles.readerAvatarOverlap,
-                        ]}
-                      >
-                        {r.avatar ? (
-                          <Image
-                            source={{ uri: r.avatar }}
-                            style={styles.readerAvatarImage}
-                          />
-                        ) : (
-                          <Text style={styles.readerAvatarInitials}>
-                            {initials}
-                          </Text>
-                        )}
-                      </View>
-                    );
-                  })}
-                </View>
-                {readers.length > 3 && (
-                  <Text style={styles.readersCountText}>
-                    +{readers.length - 3}
-                  </Text>
+                {callBusy && !inCall ? (
+                  <ActivityIndicator size="small" color={colors.primary} />
+                ) : (
+                  <Ionicons name="call-outline" size={22} color={ui.text} />
                 )}
-              </TouchableOpacity>
+              </Pressable>
             )}
-            <TouchableOpacity
-              style={styles.moreBtn}
-              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            <Pressable
+              onPress={() => setShowHeaderMenu(true)}
+              style={({ pressed }) => [styles.iconBtn, pressed && styles.iconBtnPressed]}
+              android_ripple={{ color: 'rgba(255,255,255,0.10)' }}
+              accessibilityRole="button"
+              accessibilityLabel="More options"
             >
-              <Ionicons name="ellipsis-vertical" size={20} color={colors.textMuted} />
-            </TouchableOpacity>
+              <Ionicons name="ellipsis-vertical" size={20} color={ui.textMuted} />
+            </Pressable>
           </View>
         </SafeAreaView>
       </View>
+
+      <Modal
+        visible={showHeaderMenu}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowHeaderMenu(false)}
+      >
+        <TouchableWithoutFeedback onPress={() => setShowHeaderMenu(false)}>
+          <View style={styles.readersOverlay}>
+            <TouchableWithoutFeedback>
+              <View style={styles.readersPopover}>
+                {!!(readers?.length > 0) && (
+                  <TouchableOpacity
+                    activeOpacity={0.8}
+                    onPress={() => {
+                      setShowHeaderMenu(false);
+                      setShowReadersPopover(true);
+                    }}
+                    style={styles.menuRow}
+                    accessibilityRole="button"
+                    accessibilityLabel="Seen by"
+                  >
+                    <Text style={styles.menuRowText}>Seen by</Text>
+                    <Text style={styles.menuRowMeta}>{readers.length}</Text>
+                  </TouchableOpacity>
+                )}
+                {!!headerPhoneDigits && (
+                  <TouchableOpacity
+                    activeOpacity={0.8}
+                    onPress={async () => {
+                      try {
+                        await Clipboard.setStringAsync(headerPhoneDigits);
+                      } finally {
+                        setShowHeaderMenu(false);
+                      }
+                    }}
+                    style={styles.menuRow}
+                    accessibilityRole="button"
+                    accessibilityLabel="Copy phone"
+                  >
+                    <Text style={styles.menuRowText}>Copy phone</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
 
       <Modal
         visible={showReadersPopover}
@@ -874,7 +1387,7 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
         </TouchableWithoutFeedback>
       </Modal>
 
-      <View style={styles.chatArea}>
+      <View style={[styles.chatArea, { backgroundColor: ui.bg }]}>
         {loading && (
           <View style={styles.center}>
             <ActivityIndicator size="small" color={colors.primary} />
@@ -891,6 +1404,11 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
             onEndReachedThreshold={0.3}
             ListHeaderComponent={renderHeader}
             contentContainerStyle={styles.listContent}
+            keyboardShouldPersistTaps="handled"
+            removeClippedSubviews={Platform.OS === 'android'}
+            initialNumToRender={14}
+            maxToRenderPerBatch={14}
+            windowSize={10}
           />
         )}
       </View>
@@ -899,9 +1417,15 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
         conversationId={conversationId}
         participantPhone={participantPhone}
         area={area}
+        businessPhoneId={conversationFromStore?.businessPhoneId}
         replyTo={
           replyTarget && replyPreview
-            ? { id: replyTarget.id, preview: replyPreview }
+            ? {
+                id: replyTarget.id,
+                // Pass wamid so backend can create a native WhatsApp threaded reply
+                whatsappMessageId: replyTarget.whatsappMessageId,
+                preview: replyPreview,
+              }
             : null
         }
         onCancelReply={() => setReplyTarget(null)}
@@ -1025,6 +1549,57 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                 <View style={styles.messageActionsRow}>
                   <TouchableOpacity
                     style={styles.messageActionBtn}
+                    onPress={async () => {
+                      if (!reactionCopyText) return;
+                      try {
+                        await Clipboard.setStringAsync(reactionCopyText);
+                      } finally {
+                        setReactionTarget(null);
+                      }
+                    }}
+                    disabled={reactionSending || !reactionCopyText}
+                  >
+                    <Ionicons name="copy-outline" size={18} color={colors.text} />
+                    <Text style={styles.messageActionText}>Copy</Text>
+                  </TouchableOpacity>
+
+                  {reactionTarget &&
+                    reactionTarget.type === 'text' &&
+                    reactionTarget.direction === 'incoming' &&
+                    Boolean((reactionTarget.displayText || reactionTarget.content || '').trim()) && (
+                      <TouchableOpacity
+                        style={styles.messageActionBtn}
+                        onPress={async () => {
+                          if (!reactionTarget) return;
+                          try {
+                            await toggleTranslateForMessage(reactionTarget);
+                          } finally {
+                            setReactionTarget(null);
+                          }
+                        }}
+                        disabled={
+                          reactionSending ||
+                          Boolean(
+                            (reactionTarget.whatsappMessageId ?? reactionTarget.id) &&
+                              translatingKeys.has(reactionTarget.whatsappMessageId ?? reactionTarget.id)
+                          )
+                        }
+                      >
+                        <Ionicons name="language-outline" size={18} color={colors.text} />
+                        <Text style={styles.messageActionText}>
+                          {(() => {
+                            const k = reactionTarget.whatsappMessageId ?? reactionTarget.id;
+                            const isShowing = k ? showTranslatedKeys.has(k) : false;
+                            const isBusy = k ? translatingKeys.has(k) : false;
+                            if (isBusy) return 'Translating…';
+                            return isShowing ? 'See original' : 'Translate';
+                          })()}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+
+                  <TouchableOpacity
+                    style={styles.messageActionBtn}
                     onPress={() => {
                       if (!reactionTarget) return;
                       setReplyTarget(reactionTarget);
@@ -1056,6 +1631,16 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
           </View>
         </TouchableWithoutFeedback>
       </Modal>
+
+      <CallOverlay
+        visible={inCall}
+        phase={callPhase}
+        contactName={conversationName}
+        error={callError}
+        onEndCall={() => {
+          void endCall();
+        }}
+      />
 
       <Modal
         visible={!!forwardTarget}
@@ -1162,14 +1747,23 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingTop: 8,
     paddingBottom: 8,
+    minHeight: 56,
   },
   headerLeft: {
     flexDirection: 'row',
     alignItems: 'center',
     flex: 1,
   },
-  backBtn: {
-    marginRight: 8,
+  iconBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 4,
+  },
+  iconBtnPressed: {
+    backgroundColor: 'rgba(0,0,0,0.06)',
   },
   avatar: {
     width: 36,
@@ -1179,6 +1773,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 10,
+    overflow: 'hidden',
+  },
+  avatarImage: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 18,
+    resizeMode: 'cover',
   },
   avatarText: {
     fontSize: 16,
@@ -1268,6 +1869,24 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     backgroundColor: '#111',
   },
+  menuRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 10,
+    paddingHorizontal: 6,
+    borderRadius: 8,
+  },
+  menuRowText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  menuRowMeta: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: 'rgba(255,255,255,0.72)',
+  },
   readersPopoverTitle: {
     fontSize: 12,
     fontWeight: '600',
@@ -1303,8 +1922,8 @@ const styles = StyleSheet.create({
     color: '#f5f5f5',
     flexShrink: 1,
   },
-  moreBtn: {
-    padding: 4,
+  bubbleWrapPressed: {
+    opacity: 0.92,
   },
   chatArea: {
     flex: 1,
@@ -1321,9 +1940,9 @@ const styles = StyleSheet.create({
     padding: 16,
   },
   listContent: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    paddingBottom: 24,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    paddingBottom: 18,
   },
   bubbleWrap: {
     marginVertical: 4,
@@ -1337,20 +1956,20 @@ const styles = StyleSheet.create({
   },
   bubble: {
     maxWidth: '80%',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    paddingHorizontal: 10,
+    paddingTop: 7,
+    paddingBottom: 18,
     borderRadius: 18,
-    flexDirection: 'row',
-    alignItems: 'flex-end',
+    flexDirection: 'column',
   },
-  bubbleOut: {
-    backgroundColor: colors.chatBubbleOut,
+  bubbleOutTail: {
     borderBottomRightRadius: 4,
   },
-  bubbleIn: {
-    backgroundColor: colors.chatBubbleIn,
+  bubbleInTail: {
     borderBottomLeftRadius: 4,
-    borderWidth: 1,
+  },
+  bubbleInBorder: {
+    borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.border,
   },
   bubbleHighlight: {
@@ -1476,21 +2095,88 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
     maxWidth: '100%',
   },
+  /* ── Audio / Voice-note bubble ── */
+  audioMsgWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 2,
+    minWidth: 230,
+    maxWidth: 280,
+  },
+  audioCircle: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+    flexShrink: 0,
+  },
+  audioBody: {
+    flex: 1,
+    gap: 4,
+  },
+  audioTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  audioPlayCircle: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  audioWaveWrap: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    height: 28,
+  },
+  audioBar: {
+    width: 3,
+    borderRadius: 2,
+  },
+  audioMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingLeft: 46, // align under waveform (past play btn)
+  },
+  audioElapsed: {
+    fontSize: 12,
+    fontWeight: '500',
+    fontVariant: ['tabular-nums'],
+  },
+  audioMetaRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+  },
+  audioTs: {
+    fontSize: 11,
+    fontVariant: ['tabular-nums'],
+  },
   bubbleText: {
     fontSize: 16,
     color: colors.text,
     flexShrink: 1,
-    marginRight: 6,
+    paddingRight: 52,
   },
   bubbleTime: {
     fontSize: 11,
     color: colors.textMuted,
   },
   bubbleMetaRow: {
+    position: 'absolute',
+    right: 8,
+    bottom: 4,
     flexDirection: 'row',
     alignItems: 'center',
-    alignSelf: 'flex-end',
-    marginTop: 2,
   },
   bubbleStatusIcon: {
     marginLeft: 4,
@@ -1560,11 +2246,13 @@ const styles = StyleSheet.create({
   messageActionsRow: {
     marginTop: 10,
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
     gap: 10,
   },
   messageActionBtn: {
-    flex: 1,
+    flexGrow: 1,
+    minWidth: '48%',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -1701,5 +2389,109 @@ const styles = StyleSheet.create({
   },
   reactionEmojiText: {
     fontSize: 24,
+  },
+  // ── Reply context (quoted message) ──
+  replyContextBox: {
+    flexDirection: 'row',
+    borderRadius: 6,
+    marginBottom: 6,
+    overflow: 'hidden',
+  },
+  replyContextBoxOut: {
+    backgroundColor: 'rgba(0,0,0,0.12)',
+  },
+  replyContextBoxIn: {
+    backgroundColor: 'rgba(0,0,0,0.07)',
+  },
+  replyContextAccent: {
+    width: 3,
+    backgroundColor: '#25D366',
+  },
+  replyContextBody: {
+    flex: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  replyContextText: {
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  // ── Forwarded badge ──
+  forwardedBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginBottom: 4,
+  },
+  forwardedBadgeText: {
+    fontSize: 11,
+    fontStyle: 'italic',
+  },
+  // ── Internal note ──
+  bubbleInternal: {
+    backgroundColor: '#FFF9C4',
+    borderWidth: 1,
+    borderColor: '#F0C040',
+  },
+  internalBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginBottom: 4,
+  },
+  internalBadgeText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#92680A',
+  },
+  // ── Document bubble ──
+  documentBubble: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    padding: 4,
+    minWidth: 200,
+    maxWidth: 280,
+  },
+  documentIconWrap: {
+    marginRight: 10,
+    paddingTop: 2,
+  },
+  documentInfo: {
+    flex: 1,
+  },
+  documentFilename: {
+    fontSize: 14,
+    fontWeight: '600',
+    lineHeight: 18,
+  },
+  documentDownload: {
+    fontSize: 12,
+    marginTop: 2,
+  },
+  // ── Location bubble ──
+  locationBubble: {
+    padding: 4,
+    minWidth: 180,
+    maxWidth: 260,
+  },
+  locationIconRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 4,
+  },
+  locationTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    flex: 1,
+  },
+  locationAddress: {
+    fontSize: 12,
+    lineHeight: 16,
+    marginBottom: 2,
+  },
+  locationCoords: {
+    fontSize: 11,
+    fontVariant: ['tabular-nums'],
   },
 });

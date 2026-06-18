@@ -1,8 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ActionSheetIOS,
   ActivityIndicator,
+  Alert,
   FlatList,
   Modal,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -13,12 +16,19 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import { Audio } from 'expo-av';
+import * as ImagePicker from 'expo-image-picker';
+import * as DocumentPicker from 'expo-document-picker';
 import {
+  ensurePhoneId,
   fetchWhatsAppTemplates,
   getTemplatePreview,
   getTemplateVariables,
   sendMessage,
   sendTemplate,
+  sendMediaMessage,
+  uploadWhatsAppMedia,
+  uploadToBunny,
 } from '../services';
 import type { WhatsAppTemplate } from '../services';
 import { colors } from '../../../theme/colors';
@@ -40,10 +50,17 @@ interface MessageComposerProps {
   /** Participant phone (E.164) for sending templates - required when templateOnly */
   participantPhone?: string;
   /** Current area (athens/thessaloniki) so backend sends from correct number */
-  area?: 'athens' | 'thessaloniki';
-  /** Optional reply target (UI + quoted prefix since backend doesn't support reply metadata yet). */
+  area?: string;
+  /** Frozen business line for this thread — used for channel-scoped template fetch */
+  businessPhoneId?: string;
+  /**
+   * Optional reply target. `whatsappMessageId` is the wamid sent to the backend
+   * for native WhatsApp threaded replies; `preview` is shown in the UI bar.
+   */
   replyTo?: {
     id: string;
+    /** wamid of the message being replied to — passed to send-message API */
+    whatsappMessageId?: string;
     preview: string;
   } | null;
   onCancelReply?: () => void;
@@ -60,8 +77,9 @@ interface MessageComposerProps {
   /**
    * Called immediately when user hits send so the parent can show an optimistic
    * bubble with status='sending'. Returns a temp id the parent assigned.
+   * Optional type + mediaUrl let the caller pre-fill media bubbles (e.g. voice notes).
    */
-  onOptimisticAdd?: (content: string) => string;
+  onOptimisticAdd?: (content: string, type?: import('../types').Message['type'], mediaUrl?: string) => string;
   /**
    * Called once the API resolves. Pass status='failed' on error so the parent
    * can update the bubble's icon. On success, the parent re-fetches.
@@ -73,6 +91,7 @@ export function MessageComposer({
   conversationId,
   participantPhone,
   area,
+  businessPhoneId,
   replyTo = null,
   onCancelReply,
   templateOnly = false,
@@ -84,6 +103,12 @@ export function MessageComposer({
 }: MessageComposerProps) {
   const insets = useSafeAreaInsets();
   const [text, setText] = useState('');
+  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+  const [recordingMs, setRecordingMs] = useState(0);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [pendingVoiceUri, setPendingVoiceUri] = useState<string | null>(null);
+  const [pendingVoiceMs, setPendingVoiceMs] = useState(0);
+  const [voiceBusy, setVoiceBusy] = useState(false);
 
   // Live countdown whenever we know window end (conversation has started).
   const [remainingMs, setRemainingMs] = useState<number>(() =>
@@ -114,6 +139,23 @@ export function MessageComposer({
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
 
+  const stopRecordingTimer = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      stopRecordingTimer();
+      if (recording) {
+        recording.stopAndUnloadAsync().catch(() => {});
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const openTemplateModal = useCallback(async () => {
     setShowTemplateModal(true);
     setSelectedTemplate(null);
@@ -122,15 +164,31 @@ export function MessageComposer({
     setTemplatesError(null);
     setTemplatesLoading(true);
     try {
-      const list = await fetchWhatsAppTemplates();
-      setTemplates(list);
+      const isRealConversationId = (id?: string) => Boolean(id && /^[a-fA-F0-9]{24}$/.test(id));
+      let phoneNumberId = businessPhoneId?.trim() || undefined;
+      if (!isRealConversationId(conversationId) && !phoneNumberId && area) {
+        phoneNumberId = await ensurePhoneId(area);
+      }
+      const result = await fetchWhatsAppTemplates({
+        ...(isRealConversationId(conversationId) ? { conversationId } : {}),
+        ...(phoneNumberId ? { phoneNumberId } : {}),
+      });
+      setTemplates(result.templates);
+      if (result.warning && result.templates.length === 0) {
+        setTemplatesError(result.warning);
+      } else if (result.metaUnavailable && result.templates.length === 0) {
+        setTemplatesError(
+          result.warning ??
+            'Templates are unavailable for this line. Check WhatsApp Channels admin for a valid access token.',
+        );
+      }
     } catch (e) {
       setTemplatesError(e instanceof Error ? e.message : 'Failed to load templates');
       setTemplates([]);
     } finally {
       setTemplatesLoading(false);
     }
-  }, []);
+  }, [conversationId, businessPhoneId, area]);
 
   const onSelectTemplate = useCallback((template: WhatsAppTemplate) => {
     setSelectedTemplate(template);
@@ -204,18 +262,13 @@ export function MessageComposer({
     if (!content || !conversationId) return;
     const to = participantPhone ?? '';
 
-    const replyPrefix =
-      replyTo?.preview?.trim()
-        ? `↩︎ Replying to:\n> ${replyTo.preview.trim().replace(/\n/g, ' ')}\n\n`
-        : '';
-    const outgoing = `${replyPrefix}${content}`;
-
-    // Optimistically insert the bubble immediately
-    const tempId = onOptimisticAdd?.(outgoing);
+    // Optimistically insert the bubble immediately (show clean content, no prefix)
+    const tempId = onOptimisticAdd?.(content);
     setText('');
 
     try {
-      await sendMessage(conversationId, to, outgoing, 'text', area);
+      // Pass wamid to backend for native WhatsApp threaded replies
+      await sendMessage(conversationId, to, content, 'text', replyTo?.whatsappMessageId);
       if (tempId) onOptimisticSetStatus?.(tempId, 'sent');
       onMessageSent?.();
       onCancelReply?.();
@@ -226,8 +279,9 @@ export function MessageComposer({
       } else {
         setText(content); // fallback: restore if parent doesn't support optimistic
       }
+      Alert.alert('Send failed', 'Could not send message. Check channel credentials in WhatsApp Channels admin.');
     }
-  }, [text, conversationId, participantPhone, area, onMessageSent, onOptimisticAdd, onOptimisticSetStatus, replyTo, onCancelReply]);
+  }, [text, conversationId, participantPhone, onMessageSent, onOptimisticAdd, onOptimisticSetStatus, replyTo, onCancelReply]);
 
   const variables = selectedTemplate ? getTemplateVariables(selectedTemplate) : [];
   const preview = selectedTemplate
@@ -252,6 +306,227 @@ export function MessageComposer({
       : remainingMs > 2 * 3600 * 1000
         ? '#f59e0b'
         : '#ef4444';
+
+  const canRecordVoiceNote =
+    !composerTemplateMode && Boolean(conversationId) && Boolean(participantPhone) && canSendFreeText;
+
+  const recordingLabel = useCallback((ms: number) => {
+    const totalSec = Math.floor(ms / 1000);
+    const mm = String(Math.floor(totalSec / 60)).padStart(2, '0');
+    const ss = String(totalSec % 60).padStart(2, '0');
+    return `${mm}:${ss}`;
+  }, []);
+
+  const handleToggleVoiceRecord = useCallback(async () => {
+    if (!canRecordVoiceNote || !conversationId) return;
+
+    // Stop → move to preview (no auto-send)
+    if (recording) {
+      try {
+        stopRecordingTimer();
+        await recording.stopAndUnloadAsync();
+        const uri = recording.getURI();
+        setRecording(null);
+        const capturedMs = recordingMs;
+        setRecordingMs(0);
+        if (!uri) return;
+        setPendingVoiceUri(uri);
+        setPendingVoiceMs(capturedMs);
+      } catch {
+        setRecording(null);
+        setRecordingMs(0);
+      }
+      return;
+    }
+
+    // Start recording
+    try {
+      setSendError(null);
+      // If there is a pending voice note, starting a new recording replaces it.
+      setPendingVoiceUri(null);
+      setPendingVoiceMs(0);
+      await Audio.requestPermissionsAsync();
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+      });
+
+      const rec = new Audio.Recording();
+      await rec.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+      await rec.startAsync();
+      setRecording(rec);
+      setRecordingMs(0);
+
+      stopRecordingTimer();
+      recordingTimerRef.current = setInterval(async () => {
+        try {
+          const status = await rec.getStatusAsync();
+          if (status.isRecording && typeof status.durationMillis === 'number') {
+            setRecordingMs(status.durationMillis);
+          }
+        } catch {
+          // ignore
+        }
+      }, 200);
+    } catch {
+      setRecording(null);
+      setRecordingMs(0);
+    }
+  }, [
+    canRecordVoiceNote,
+    conversationId,
+    onMessageSent,
+    onOptimisticAdd,
+    onOptimisticSetStatus,
+    participantPhone,
+    recording,
+    recordingMs,
+    stopRecordingTimer,
+  ]);
+
+  const handleDeletePendingVoice = useCallback(() => {
+    setPendingVoiceUri(null);
+    setPendingVoiceMs(0);
+  }, []);
+
+  /** Upload a media file to Bunny CDN then send via send-media */
+  const handleSendMediaFile = useCallback(
+    async (params: { uri: string; mimeType: string; filename: string; mediaType: 'image' | 'video' | 'document' }) => {
+      if (!conversationId || !participantPhone) return;
+      const { uri, mimeType, filename, mediaType } = params;
+      const preview =
+        mediaType === 'image' ? 'Photo' : mediaType === 'video' ? 'Video' : filename;
+      const tempId = onOptimisticAdd?.(preview, mediaType as any, mediaType !== 'document' ? uri : undefined);
+      try {
+        const uploaded = await uploadToBunny({ uri, mimeType, filename });
+        const mediaUrl = uploaded.url;
+        if (!mediaUrl) throw new Error('Upload returned no URL');
+        await sendMediaMessage({
+          conversationId,
+          to: participantPhone,
+          mediaType,
+          mediaUrl,
+          filename: mediaType === 'document' ? filename : undefined,
+        });
+        if (tempId) onOptimisticSetStatus?.(tempId, 'sent');
+        onMessageSent?.();
+      } catch (e) {
+        if (tempId) onOptimisticSetStatus?.(tempId, 'failed');
+        Alert.alert('Send failed', e instanceof Error ? e.message : 'Could not send file');
+      }
+    },
+    [conversationId, participantPhone, onOptimisticAdd, onOptimisticSetStatus, onMessageSent],
+  );
+
+  const handlePickImage = useCallback(async () => {
+    try {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Permission needed', 'Allow access to your photo library to send images.');
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images', 'videos'],
+        allowsMultipleSelection: false,
+        quality: 0.85,
+      });
+      if (result.canceled || !result.assets?.length) return;
+      const asset = result.assets[0];
+      const isVideo = asset.type === 'video';
+      const mimeType = asset.mimeType ?? (isVideo ? 'video/mp4' : 'image/jpeg');
+      const ext = mimeType.split('/')[1] ?? (isVideo ? 'mp4' : 'jpg');
+      const filename = asset.fileName ?? `media-${Date.now()}.${ext}`;
+      await handleSendMediaFile({ uri: asset.uri, mimeType, filename, mediaType: isVideo ? 'video' : 'image' });
+    } catch (e) {
+      Alert.alert('Error', e instanceof Error ? e.message : 'Could not pick image');
+    }
+  }, [handleSendMediaFile]);
+
+  const handlePickDocument = useCallback(async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true });
+      if (result.canceled || !result.assets?.length) return;
+      const asset = result.assets[0];
+      const mimeType = asset.mimeType ?? 'application/octet-stream';
+      const filename = asset.name ?? `document-${Date.now()}`;
+      await handleSendMediaFile({ uri: asset.uri, mimeType, filename, mediaType: 'document' });
+    } catch (e) {
+      Alert.alert('Error', e instanceof Error ? e.message : 'Could not pick document');
+    }
+  }, [handleSendMediaFile]);
+
+  const handleAttachmentPress = useCallback(() => {
+    if (!canSendFreeText) return;
+    if (Platform.OS === 'ios') {
+      ActionSheetIOS.showActionSheetWithOptions(
+        {
+          options: ['Cancel', 'Photo / Video', 'Document'],
+          cancelButtonIndex: 0,
+        },
+        (idx) => {
+          if (idx === 1) handlePickImage();
+          else if (idx === 2) handlePickDocument();
+        },
+      );
+    } else {
+      Alert.alert('Attach', 'Choose attachment type', [
+        { text: 'Photo / Video', onPress: handlePickImage },
+        { text: 'Document', onPress: handlePickDocument },
+        { text: 'Cancel', style: 'cancel' },
+      ]);
+    }
+  }, [canSendFreeText, handlePickImage, handlePickDocument]);
+
+  const handleSendPendingVoice = useCallback(async () => {
+    if (!conversationId || !participantPhone || !pendingVoiceUri || voiceBusy) return;
+    setVoiceBusy(true);
+    try {
+      const filename = `voice-note-${Date.now()}.m4a`;
+      const upload = await uploadWhatsAppMedia({
+        uri: pendingVoiceUri,
+        // Expo preset outputs m4a (audio/mp4) on both iOS/Android.
+        mimeType: 'audio/mp4',
+        filename,
+      });
+      const mediaId = upload.mediaId;
+      const mediaUrl = upload.url;
+      if (!mediaId) return;
+
+      const to = participantPhone ?? '';
+      // Pass 'audio' type + the local file URI so the optimistic bubble is
+      // immediately playable from the on-device recording while the upload finishes.
+      const tempId = onOptimisticAdd?.('Voice note', 'audio', pendingVoiceUri);
+      try {
+        await sendMediaMessage({
+          conversationId,
+          to,
+          mediaType: 'audio',
+          mediaId,
+          ...(mediaUrl ? { mediaUrl } : {}),
+          filename,
+        });
+        if (tempId) onOptimisticSetStatus?.(tempId, 'sent');
+        onMessageSent?.();
+        setPendingVoiceUri(null);
+        setPendingVoiceMs(0);
+      } catch {
+        if (tempId) onOptimisticSetStatus?.(tempId, 'failed');
+      }
+    } finally {
+      setVoiceBusy(false);
+    }
+  }, [
+    conversationId,
+    onMessageSent,
+    onOptimisticAdd,
+    onOptimisticSetStatus,
+    participantPhone,
+    pendingVoiceUri,
+    voiceBusy,
+  ]);
 
   return (
     <>
@@ -325,8 +600,12 @@ export function MessageComposer({
       )}
 
       <View style={[styles.inputBar, { paddingBottom: Math.max(8, insets.bottom) }]}>
-        <TouchableOpacity style={styles.inputIconBtn}>
-          <Ionicons name="add" size={24} color={colors.textMuted} />
+        <TouchableOpacity
+          style={styles.inputIconBtn}
+          onPress={handleAttachmentPress}
+          disabled={!canSendFreeText}
+        >
+          <Ionicons name="add" size={24} color={canSendFreeText ? colors.textMuted : 'rgba(0,0,0,0.25)'} />
         </TouchableOpacity>
         {composerTemplateMode ? (
           <TouchableOpacity
@@ -358,9 +637,46 @@ export function MessageComposer({
           >
             <Ionicons name="send" size={20} color="#fff" />
           </TouchableOpacity>
+        ) : pendingVoiceUri ? (
+          <View style={styles.voicePreviewActions}>
+            <TouchableOpacity
+              style={styles.voiceDeleteBtn}
+              onPress={handleDeletePendingVoice}
+              disabled={voiceBusy}
+            >
+              <Ionicons name="trash-outline" size={20} color={colors.textMuted} />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.sendBtn, voiceBusy && styles.sendBtnDisabled]}
+              onPress={handleSendPendingVoice}
+              disabled={voiceBusy}
+            >
+              {voiceBusy ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Ionicons name="send" size={20} color="#fff" />
+              )}
+            </TouchableOpacity>
+          </View>
         ) : (
-          <TouchableOpacity style={styles.inputIconBtn}>
-            <Ionicons name="mic-outline" size={22} color={colors.textMuted} />
+          <TouchableOpacity
+            style={styles.inputIconBtn}
+            onPress={handleToggleVoiceRecord}
+            disabled={!canRecordVoiceNote}
+          >
+            {recording ? (
+              <View style={styles.recordingInline}>
+                <View style={styles.recordingDot} />
+                <Text style={styles.recordingInlineText}>{recordingLabel(recordingMs)}</Text>
+                <Ionicons name="stop-circle-outline" size={22} color={colors.textMuted} />
+              </View>
+            ) : (
+              <Ionicons
+                name="mic-outline"
+                size={22}
+                color={canRecordVoiceNote ? colors.textMuted : 'rgba(0,0,0,0.25)'}
+              />
+            )}
           </TouchableOpacity>
         )}
       </View>
@@ -616,6 +932,22 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
     paddingBottom: 6,
   },
+  recordingInline: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  recordingDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#FF3B30',
+  },
+  recordingInlineText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.textMuted,
+  },
   inputBox: {
     flex: 1,
     backgroundColor: colors.background,
@@ -642,6 +974,25 @@ const styles = StyleSheet.create({
     height: 40,
     borderRadius: 20,
     backgroundColor: colors.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sendBtnDisabled: {
+    opacity: 0.7,
+  },
+  voicePreviewActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingBottom: 2,
+  },
+  voiceDeleteBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: colors.background,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
     alignItems: 'center',
     justifyContent: 'center',
   },

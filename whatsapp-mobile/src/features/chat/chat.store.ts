@@ -1,10 +1,15 @@
 import { create } from 'zustand';
 import type { ChatState, Conversation, Message, PhoneConfig } from './types';
+import { guestOutboundIncrementsForMessage } from './utils/guestOutboundStats';
 
 interface ChatStore extends ChatState {
   setConversations: (conversations: Conversation[]) => void;
   appendConversations: (conversations: Conversation[]) => void;
+  prependConversation: (conversation: Conversation) => void;
+  updateConversation: (id: string, updates: Partial<Conversation>) => void;
   setArchivedConversations: (archivedConversations: Conversation[]) => void;
+  setArchivedCount: (count: number) => void;
+  markConversationReadLocal: (conversationId: string) => void;
   setActiveConversation: (id: string | null) => void;
   setMessages: (conversationId: string, messages: Message[]) => void;
   addMessage: (message: Message) => void;
@@ -15,6 +20,9 @@ interface ChatStore extends ChatState {
     previewText: string;
     timestamp: number;
     direction?: 'incoming' | 'outgoing';
+    messageType?: Message['type'];
+    /** Full text+caption for guest outbound stats (matches server aggregation). */
+    statsBodyText?: string;
   }) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
@@ -27,6 +35,8 @@ const initialState: ChatState = {
   activeConversationId: null,
   messages: {},
   phoneConfigs: null,
+  archivedConversations: [],
+  archivedCount: 0,
   isLoading: false,
   error: null,
 };
@@ -40,11 +50,30 @@ export const useChatStore = create<ChatStore>((set) => ({
       const newOnes = conversations.filter((c) => !existingIds.has(c.id));
       return { conversations: [...state.conversations, ...newOnes] };
     }),
-    setArchivedConversations: (archivedConversations) =>
-      set((state) => ({
-        ...state,
-        archivedConversations,
-      })),
+  prependConversation: (conversation) =>
+    set((state) => {
+      const exists = state.conversations.some((c) => c.id === conversation.id);
+      if (exists) return state as any;
+      return { conversations: [conversation, ...state.conversations] };
+    }),
+  updateConversation: (id, updates) =>
+    set((state) => {
+      const idx = state.conversations.findIndex((c) => c.id === id);
+      if (idx === -1) return state as any;
+      const next = [...state.conversations];
+      next[idx] = { ...next[idx], ...updates };
+      return { conversations: next };
+    }),
+  setArchivedConversations: (archivedConversations) => set({ archivedConversations }),
+  setArchivedCount: (archivedCount) => set({ archivedCount }),
+  markConversationReadLocal: (conversationId) =>
+    set((state) => {
+      const idx = state.conversations.findIndex((c) => c.id === conversationId);
+      if (idx === -1) return state as any;
+      const next = [...state.conversations];
+      next[idx] = { ...next[idx], unreadCount: 0 };
+      return { conversations: next };
+    }),
   setActiveConversation: (activeConversationId) => set({ activeConversationId }),
   setMessages: (conversationId, messages) =>
     set((state) => ({
@@ -131,7 +160,14 @@ export const useChatStore = create<ChatStore>((set) => ({
       };
       return { messages: { ...state.messages, [conversationId]: next } };
     }),
-  upsertConversationFromMessage: ({ conversationId, previewText, timestamp, direction }) =>
+  upsertConversationFromMessage: ({
+    conversationId,
+    previewText,
+    timestamp,
+    direction,
+    messageType,
+    statsBodyText,
+  }) =>
     set((state) => {
       const list = state.conversations ?? [];
       const idx = list.findIndex((c) => c.id === conversationId);
@@ -141,11 +177,25 @@ export const useChatStore = create<ChatStore>((set) => ({
         direction === 'incoming' && state.activeConversationId !== conversationId
           ? (conv.unreadCount ?? 0) + 1
           : conv.unreadCount ?? 0;
+
+      let listingLinkSentCount = conv.listingLinkSentCount ?? 0;
+      let optionsSentCount = conv.optionsSentCount ?? 0;
+      if (direction === 'outgoing' && conv.conversationType === 'guest') {
+        const inc = guestOutboundIncrementsForMessage({
+          bodyText: statsBodyText ?? previewText,
+          messageType,
+        });
+        listingLinkSentCount += inc.listingLink;
+        optionsSentCount += inc.optionsSent;
+      }
+
       const updated: Conversation = {
         ...conv,
         lastMessage: previewText,
         lastMessageAt: timestamp,
         unreadCount,
+        listingLinkSentCount,
+        optionsSentCount,
       };
       const next = [...list];
       next[idx] = updated;
