@@ -5,6 +5,8 @@ import { useTheme, type ThemePreference } from './ThemeContext';
 
 type Props = {
   compact?: boolean;
+  /** Borderless toolbar style — no surface fill or border. */
+  ghost?: boolean;
 };
 
 function iconForPreference(preference: ThemePreference): keyof typeof Ionicons.glyphMap {
@@ -18,7 +20,7 @@ function iconForPreference(preference: ThemePreference): keyof typeof Ionicons.g
   }
 }
 
-export function ThemeToggleButton({ compact = false }: Props) {
+export function ThemeToggleButton({ compact = false, ghost = false }: Props) {
   const { colors, preference, preferenceLabel, cycleTheme } = useTheme();
 
   return (
@@ -30,14 +32,20 @@ export function ThemeToggleButton({ compact = false }: Props) {
       style={({ pressed }) => [
         styles.button,
         compact ? styles.buttonCompact : null,
-        {
-          backgroundColor: colors.surface,
-          borderColor: colors.border,
-        },
+        ghost
+          ? styles.buttonGhost
+          : {
+              backgroundColor: colors.surface,
+              borderColor: colors.border,
+            },
         pressed ? styles.pressed : null,
       ]}
     >
-      <Ionicons name={iconForPreference(preference)} size={compact ? 18 : 20} color={colors.textSecondary} />
+      <Ionicons
+        name={iconForPreference(preference)}
+        size={compact ? 20 : 20}
+        color={colors.textMuted}
+      />
       {!compact ? (
         <View style={styles.labelWrap}>
           <Text style={[styles.label, { color: colors.textSecondary }]}>{preferenceLabel}</Text>
@@ -71,6 +79,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 0,
     justifyContent: 'center',
   },
+  buttonGhost: {
+    backgroundColor: 'transparent',
+    borderWidth: 0,
+  },
   labelWrap: {
     paddingRight: 2,
   },
@@ -79,6 +91,6 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   pressed: {
-    opacity: 0.78,
+    opacity: 0.55,
   },
 });

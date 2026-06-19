@@ -1,5 +1,5 @@
-import React, { type ReactNode } from 'react';
-import { StatusBar } from 'expo-status-bar';
+import React, { type ReactNode, useEffect } from 'react';
+import { Platform, StatusBar, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { RootNavigator } from '../navigation/RootNavigator';
@@ -10,9 +10,28 @@ interface AppProvidersProps {
   children?: ReactNode;
 }
 
-function ThemedStatusBar() {
-  const { isDark } = useTheme();
-  return <StatusBar style={isDark ? 'light' : 'dark'} />;
+function ThemedAppShell({ children }: { children: ReactNode }) {
+  const { isDark, colors } = useTheme();
+  const statusBarBackground = isDark ? colors.background : '#FFFFFF';
+  const barStyle = isDark ? 'light-content' : 'dark-content';
+
+  useEffect(() => {
+    StatusBar.setBarStyle(barStyle, true);
+    if (Platform.OS === 'android') {
+      StatusBar.setBackgroundColor(statusBarBackground, true);
+    }
+  }, [barStyle, statusBarBackground]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: statusBarBackground }}>
+      <StatusBar
+        barStyle={barStyle}
+        backgroundColor={statusBarBackground}
+        translucent={Platform.OS === 'android'}
+      />
+      {children}
+    </View>
+  );
 }
 
 /**
@@ -23,9 +42,10 @@ export function AppProviders({ children }: AppProvidersProps) {
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
         <ThemeProvider>
-          <ThemedStatusBar />
-          <InAppNotificationBanner />
-          {children ?? <RootNavigator />}
+          <ThemedAppShell>
+            <InAppNotificationBanner />
+            {children ?? <RootNavigator />}
+          </ThemedAppShell>
         </ThemeProvider>
       </SafeAreaProvider>
     </GestureHandlerRootView>

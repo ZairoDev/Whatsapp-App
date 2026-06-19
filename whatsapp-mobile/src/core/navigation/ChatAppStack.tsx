@@ -9,7 +9,7 @@ import type { RootStackParamList } from './RootNavigator';
 import { useWhatsAppRealtime } from '../../features/chat/hooks';
 
 export type ChatAppStackParamList = {
-  ConversationList: { initialArea?: string } | undefined;
+  ConversationList: { initialArea?: string; initialAdminQueue?: boolean } | undefined;
   ConversationDetail: {
     conversationId: string;
     area: string;
@@ -44,7 +44,8 @@ const Stack = createNativeStackNavigator<ChatAppStackParamList>();
 
 export function ChatAppStack() {
   const route = useRoute<RouteProp<RootStackParamList, 'ChatApp'>>();
-  const initialArea = route.params?.initialArea;
+  const initialArea =
+    route.params?.screen === 'ConversationList' ? route.params.params?.initialArea : undefined;
   useWhatsAppRealtime();
 
   return (

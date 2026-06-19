@@ -3,15 +3,14 @@ import {
   ActionSheetIOS,
   ActivityIndicator,
   Alert,
-  FlatList,
-  Modal,
+  Animated,
+  Keyboard,
   Platform,
-  ScrollView,
+  Pressable,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
-  TouchableWithoutFeedback,
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -33,6 +32,13 @@ import {
 import type { WhatsAppTemplate } from '../services';
 import { useTheme } from '../../../theme/ThemeContext';
 import type { AppColors } from '../../../theme/palettes';
+import { EmojiKeyboard } from './EmojiKeyboard';
+import { TemplatePickerSheet } from './TemplatePickerSheet';
+import {
+  getComposerBottomPadding,
+  getDefaultAccessoryHeight,
+  getKeyboardLayoutInset,
+} from '../utils/accessoryHeight';
 
 /** Format milliseconds remaining into "Xh Ym" or "Ym Zs" */
 function formatCountdown(ms: number): string {
@@ -86,6 +92,12 @@ interface MessageComposerProps {
    * can update the bubble's icon. On success, the parent re-fetches.
    */
   onOptimisticSetStatus?: (tempId: string, status: 'sent' | 'failed') => void;
+  /** Last measured system keyboard height — used to size the emoji panel identically. */
+  lastKeyboardHeight?: number;
+  /** Last system keyboard animation duration in ms (iOS). */
+  lastKeyboardDuration?: number;
+  /** Notifies parent when emoji panel is in the layout (not for keyboard padding). */
+  onEmojiPickerOpenChange?: (open: boolean) => void;
 }
 
 export function MessageComposer({
@@ -101,10 +113,19 @@ export function MessageComposer({
   onMessageSent,
   onOptimisticAdd,
   onOptimisticSetStatus,
+  lastKeyboardHeight = 0,
+  lastKeyboardDuration = 250,
+  onEmojiPickerOpenChange,
 }: MessageComposerProps) {
-  const { colors } = useTheme();
-  const styles = useMemo(() => createComposerStyles(colors), [colors]);
+  const { colors, isDark } = useTheme();
+  const styles = useMemo(() => createComposerStyles(colors, isDark), [colors, isDark]);
   const insets = useSafeAreaInsets();
+  const textInputRef = useRef<TextInput>(null);
+  const pendingEmojiOpenRef = useRef(false);
+  const emojiPanelAnim = useRef(new Animated.Value(0)).current;
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [emojiPanelHeight, setEmojiPanelHeight] = useState(0);
   const [text, setText] = useState('');
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [recordingMs, setRecordingMs] = useState(0);
@@ -118,6 +139,119 @@ export function MessageComposer({
     windowExpiresAt ? Math.max(0, windowExpiresAt - Date.now()) : 0
   );
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const resolveEmojiPanelHeight = useCallback(() => {
+    const rawHeight = lastKeyboardHeight > 0 ? lastKeyboardHeight : getDefaultAccessoryHeight();
+    return getKeyboardLayoutInset(rawHeight, insets.bottom);
+  }, [lastKeyboardHeight, insets.bottom]);
+
+  const animateEmojiPanel = useCallback(
+    (toValue: number, duration = lastKeyboardDuration, onEnd?: () => void) => {
+      emojiPanelAnim.stopAnimation();
+      Animated.timing(emojiPanelAnim, {
+        toValue,
+        duration: Math.max(120, duration),
+        useNativeDriver: false,
+      }).start(({ finished }) => {
+        if (finished) onEnd?.();
+      });
+    },
+    [emojiPanelAnim, lastKeyboardDuration],
+  );
+
+  const revealEmojiPicker = useCallback(
+    (animated = true) => {
+      const targetHeight = resolveEmojiPanelHeight();
+      setEmojiPanelHeight(targetHeight);
+      setShowEmojiPicker(true);
+      onEmojiPickerOpenChange?.(true);
+      if (animated) {
+        emojiPanelAnim.setValue(0);
+        animateEmojiPanel(targetHeight);
+      } else {
+        emojiPanelAnim.setValue(targetHeight);
+      }
+    },
+    [animateEmojiPanel, emojiPanelAnim, onEmojiPickerOpenChange, resolveEmojiPanelHeight],
+  );
+
+  const closeEmojiPicker = useCallback(() => {
+    pendingEmojiOpenRef.current = false;
+    onEmojiPickerOpenChange?.(false);
+    animateEmojiPanel(0, lastKeyboardDuration, () => {
+      setShowEmojiPicker(false);
+      setEmojiPanelHeight(0);
+    });
+  }, [animateEmojiPanel, lastKeyboardDuration, onEmojiPickerOpenChange]);
+
+  useEffect(() => {
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const showSub = Keyboard.addListener(showEvent, () => {
+      setKeyboardVisible(true);
+      if (showEmojiPicker) {
+        closeEmojiPicker();
+      }
+    });
+    const hideSub = Keyboard.addListener(hideEvent, () => {
+      setKeyboardVisible(false);
+      if (pendingEmojiOpenRef.current) {
+        pendingEmojiOpenRef.current = false;
+        revealEmojiPicker(false);
+      }
+    });
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, [closeEmojiPicker, revealEmojiPicker, showEmojiPicker]);
+
+  const openEmojiPicker = useCallback(() => {
+    if (keyboardVisible) {
+      pendingEmojiOpenRef.current = true;
+      Keyboard.dismiss();
+      return;
+    }
+    revealEmojiPicker();
+  }, [keyboardVisible, revealEmojiPicker]);
+
+  const toggleEmojiPicker = useCallback(() => {
+    if (showEmojiPicker) {
+      closeEmojiPicker();
+      textInputRef.current?.focus();
+      return;
+    }
+    openEmojiPicker();
+  }, [showEmojiPicker, closeEmojiPicker, openEmojiPicker]);
+
+  const handleEmojiSelected = useCallback((emoji: string) => {
+    setText((prev) => {
+      if (prev.length >= 4096) return prev;
+      return prev + emoji;
+    });
+  }, []);
+
+  const handleShowKeyboardFromEmoji = useCallback(() => {
+    closeEmojiPicker();
+    requestAnimationFrame(() => {
+      textInputRef.current?.focus();
+    });
+  }, [closeEmojiPicker]);
+
+  useEffect(() => {
+    return () => {
+      onEmojiPickerOpenChange?.(false);
+    };
+  }, [onEmojiPickerOpenChange]);
+
+  useEffect(() => {
+    if (!showEmojiPicker) return;
+    const targetHeight = resolveEmojiPanelHeight();
+    if (targetHeight !== emojiPanelHeight) {
+      setEmojiPanelHeight(targetHeight);
+      animateEmojiPanel(targetHeight, 0);
+    }
+  }, [animateEmojiPanel, emojiPanelHeight, resolveEmojiPanelHeight, showEmojiPicker]);
 
   useEffect(() => {
     if (!windowExpiresAt) {
@@ -531,56 +665,14 @@ export function MessageComposer({
     voiceBusy,
   ]);
 
+  const composerBottomPadding = getComposerBottomPadding({
+    keyboardVisible,
+    emojiPickerOpen: showEmojiPicker,
+    safeAreaBottom: insets.bottom,
+  });
+
   return (
     <>
-      {showTemplateInfoBar && (
-        <View style={styles.infoBar}>
-          <View style={styles.infoBarLeft}>
-            <View style={styles.infoIconWrap}>
-              <Ionicons
-                name={conversationStarted ? 'lock-closed-outline' : 'chatbubbles-outline'}
-                size={18}
-                color={colors.textMuted}
-              />
-            </View>
-            <View style={styles.infoTextBlock}>
-              <Text style={styles.infoTitle}>
-                {conversationStarted ? '24-hour window closed' : 'Start with a template'}
-              </Text>
-              <Text style={styles.infoSubtitle}>
-                {conversationStarted
-                  ? 'You can only send template messages'
-                  : "This chat hasn't started — send a template so the customer can reply"}
-              </Text>
-            </View>
-          </View>
-          <TouchableOpacity style={styles.infoButton} onPress={openTemplateModal}>
-            <Ionicons name="documents-outline" size={16} color="#fff" />
-            <Text style={styles.infoButtonText}>Send Template</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {showCountdownInfoBar && (
-        <View style={styles.infoBar}>
-          <View style={styles.infoBarLeft}>
-            <View style={styles.infoIconWrap}>
-              <Ionicons name="time-outline" size={18} color={countdownColor} />
-            </View>
-            <View style={styles.infoTextBlock}>
-              <Text style={styles.infoTitle}>Messaging window</Text>
-              <Text style={styles.infoSubtitle}>
-                Free messages close in{' '}
-                <Text style={[styles.countdownValue, { color: countdownColor }]}>
-                  {formatCountdown(remainingMs)}
-                </Text>
-                {' — then only templates'}
-              </Text>
-            </View>
-          </View>
-        </View>
-      )}
-
       {!!replyTo && !composerTemplateMode && (
         <View style={styles.replyBar}>
           <View style={styles.replyBarLeft}>
@@ -602,306 +694,382 @@ export function MessageComposer({
         </View>
       )}
 
-      <View style={[styles.inputBar, { paddingBottom: Math.max(8, insets.bottom) }]}>
-        <TouchableOpacity
-          style={styles.inputIconBtn}
-          onPress={handleAttachmentPress}
-          disabled={!canSendFreeText}
-        >
-          <Ionicons name="add" size={24} color={canSendFreeText ? colors.textMuted : 'rgba(0,0,0,0.25)'} />
-        </TouchableOpacity>
-        {composerTemplateMode ? (
-          <TouchableOpacity
-            style={styles.inputBox}
-            onPress={openTemplateModal}
-            activeOpacity={0.7}
-          >
-            <Text style={styles.inputPlaceholder}>
-              Send a template message...
-            </Text>
-          </TouchableOpacity>
-        ) : (
-          <View style={styles.inputBox}>
-            <TextInput
-              style={styles.input}
-              placeholder="Message"
-              placeholderTextColor={colors.textMuted}
-              value={text}
-              onChangeText={setText}
-              multiline
-              maxLength={4096}
-            />
+      <View style={[styles.composerRoot, { paddingBottom: composerBottomPadding }]}>
+        {(showTemplateInfoBar || showCountdownInfoBar) && (
+          <View style={styles.statusStrip}>
+            {showTemplateInfoBar && (
+              <View style={styles.statusChip}>
+                <Ionicons
+                  name={conversationStarted ? 'lock-closed' : 'document-text-outline'}
+                  size={13}
+                  color="#EA4335"
+                />
+                <Text style={styles.statusChipText} numberOfLines={1}>
+                  {conversationStarted ? 'Templates only' : 'Start with a template'}
+                </Text>
+              </View>
+            )}
+            {showCountdownInfoBar && (
+              <View style={[styles.statusChip, { borderColor: `${countdownColor}55` }]}>
+                <Ionicons name="time-outline" size={13} color={countdownColor} />
+                <Text style={[styles.statusChipTimer, { color: countdownColor }]} numberOfLines={1}>
+                  {formatCountdown(remainingMs)}
+                </Text>
+              </View>
+            )}
           </View>
         )}
-        {!composerTemplateMode && text.trim().length > 0 ? (
-          <TouchableOpacity
-            style={styles.sendBtn}
-            onPress={handleSendText}
-          >
-            <Ionicons name="send" size={20} color="#fff" />
-          </TouchableOpacity>
-        ) : pendingVoiceUri ? (
-          <View style={styles.voicePreviewActions}>
-            <TouchableOpacity
-              style={styles.voiceDeleteBtn}
-              onPress={handleDeletePendingVoice}
-              disabled={voiceBusy}
-            >
-              <Ionicons name="trash-outline" size={20} color={colors.textMuted} />
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.sendBtn, voiceBusy && styles.sendBtnDisabled]}
-              onPress={handleSendPendingVoice}
-              disabled={voiceBusy}
-            >
-              {voiceBusy ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
-                <Ionicons name="send" size={20} color="#fff" />
-              )}
-            </TouchableOpacity>
-          </View>
-        ) : (
-          <TouchableOpacity
-            style={styles.inputIconBtn}
-            onPress={handleToggleVoiceRecord}
-            disabled={!canRecordVoiceNote}
-          >
-            {recording ? (
-              <View style={styles.recordingInline}>
+
+        <View style={styles.inputRow}>
+          <View style={styles.inputPill}>
+            {!composerTemplateMode && !recording && !pendingVoiceUri && (
+              <TouchableOpacity
+                style={styles.pillIconBtn}
+                onPress={toggleEmojiPicker}
+                hitSlop={6}
+                accessibilityRole="button"
+                accessibilityLabel={showEmojiPicker ? 'Show keyboard' : 'Show emojis'}
+              >
+                <Ionicons
+                  name={showEmojiPicker ? 'keypad-outline' : 'happy-outline'}
+                  size={22}
+                  color={styles.pillIcon.color}
+                />
+              </TouchableOpacity>
+            )}
+
+            {composerTemplateMode ? (
+              <Pressable style={styles.pillInputArea} onPress={openTemplateModal}>
+                <Text style={styles.inputPlaceholder} numberOfLines={1}>
+                  Tap to choose a template
+                </Text>
+              </Pressable>
+            ) : recording ? (
+              <View style={styles.recordingPillContent}>
                 <View style={styles.recordingDot} />
-                <Text style={styles.recordingInlineText}>{recordingLabel(recordingMs)}</Text>
-                <Ionicons name="stop-circle-outline" size={22} color={colors.textMuted} />
+                <Text style={styles.recordingPillText}>{recordingLabel(recordingMs)}</Text>
+                <Text style={styles.recordingPillHint}>Tap mic to stop</Text>
+              </View>
+            ) : pendingVoiceUri ? (
+              <View style={styles.recordingPillContent}>
+                <Ionicons name="mic" size={16} color={colors.primary} />
+                <Text style={styles.recordingPillText}>{recordingLabel(pendingVoiceMs)}</Text>
+                <Text style={styles.recordingPillHint}>Voice note ready</Text>
               </View>
             ) : (
-              <Ionicons
-                name="mic-outline"
-                size={22}
-                color={canRecordVoiceNote ? colors.textMuted : 'rgba(0,0,0,0.25)'}
+              <TextInput
+                ref={textInputRef}
+                style={styles.input}
+                placeholder="Message"
+                placeholderTextColor={colors.textMuted}
+                value={text}
+                onChangeText={setText}
+                onFocus={() => {
+                  if (showEmojiPicker) closeEmojiPicker();
+                }}
+                multiline
+                maxLength={4096}
               />
             )}
-          </TouchableOpacity>
-        )}
-      </View>
 
-      <Modal
-        visible={showTemplateModal}
-        transparent
-        animationType="slide"
-        onRequestClose={() => setShowTemplateModal(false)}
-      >
-        <TouchableWithoutFeedback onPress={() => setShowTemplateModal(false)}>
-          <View style={styles.modalOverlay}>
-            <TouchableWithoutFeedback>
-              <View style={styles.modalSheet}>
-                <View style={styles.modalHeader}>
+            {!composerTemplateMode && !recording && (
+              <View style={styles.pillTrailing}>
+                {pendingVoiceUri ? (
                   <TouchableOpacity
-                    onPress={
-                      selectedTemplate ? goBackToTemplateList : () => setShowTemplateModal(false)
-                    }
-                    style={styles.modalBackBtn}
+                    style={styles.pillIconBtn}
+                    onPress={handleDeletePendingVoice}
+                    disabled={voiceBusy}
+                    hitSlop={6}
                   >
-                    <Ionicons name="arrow-back" size={24} color={colors.text} />
+                    <Ionicons name="trash-outline" size={22} color={styles.pillIcon.color} />
                   </TouchableOpacity>
-                  <Text style={styles.modalTitle}>
-                    {selectedTemplate ? selectedTemplate.name : 'Choose template'}
-                  </Text>
-                  <TouchableOpacity
-                    onPress={() => setShowTemplateModal(false)}
-                    style={styles.modalCloseBtn}
-                  >
-                    <Ionicons name="close" size={24} color={colors.textMuted} />
-                  </TouchableOpacity>
-                </View>
-
-                {templatesLoading && (
-                  <View style={styles.modalCenter}>
-                    <ActivityIndicator size="small" color={colors.primary} />
-                  </View>
-                )}
-                {templatesError && !templatesLoading && (
-                  <View style={styles.modalCenter}>
-                    <Text style={styles.modalError}>{templatesError}</Text>
-                  </View>
-                )}
-                {!templatesLoading && !templatesError && !selectedTemplate && templates.length === 0 && (
-                  <View style={styles.modalCenter}>
-                    <Text style={styles.modalEmpty}>No templates available</Text>
-                  </View>
-                )}
-
-                {!templatesLoading && !selectedTemplate && templates.length > 0 && (
-                  <FlatList
-                    data={templates}
-                    keyExtractor={(item) => item.name + (item.language ?? '')}
-                    renderItem={({ item }) => (
-                      <TouchableOpacity
-                        style={styles.templateItem}
-                        onPress={() => onSelectTemplate(item)}
-                        activeOpacity={0.7}
-                      >
-                        <Text style={styles.templateItemName} numberOfLines={1}>
-                          {item.name}
-                        </Text>
-                        {item.language && (
-                          <Text style={styles.templateItemLang}>{item.language}</Text>
-                        )}
-                      </TouchableOpacity>
-                    )}
-                    style={styles.templateList}
-                  />
-                )}
-
-                {selectedTemplate && (
-                  <ScrollView
-                    style={styles.templateForm}
-                    contentContainerStyle={styles.templateFormContent}
-                    keyboardShouldPersistTaps="handled"
-                  >
-                    <View style={styles.previewSection}>
-                      <Text style={styles.previewLabel}>Preview</Text>
-                      <View style={styles.previewBubble}>
-                        {(preview?.header || preview?.body || preview?.footer) ? (
-                          <>
-                            {preview.header && (
-                              <Text style={styles.previewHeader}>{preview.header}</Text>
-                            )}
-                            {preview.body && (
-                              <Text style={styles.previewBody}>{preview.body}</Text>
-                            )}
-                            {preview.footer && (
-                              <Text style={styles.previewFooter}>{preview.footer}</Text>
-                            )}
-                          </>
-                        ) : (
-                          <Text style={styles.previewPlaceholder}>
-                            Fill in the fields below to see the message preview
-                          </Text>
-                        )}
-                      </View>
-                    </View>
-
-                    <Text style={styles.fieldsSectionLabel}>Template fields</Text>
-                    {variables.length === 0 ? (
-                      <Text style={styles.templateNoVars}>
-                        This template has no variables. Tap Send to use it.
-                      </Text>
-                    ) : (
-                      variables.map((label, i) => (
-                        <View key={label} style={styles.fieldWrap}>
-                          <Text style={styles.fieldLabel}>{label}</Text>
-                          <TextInput
-                            style={styles.fieldInput}
-                            placeholder={`Enter value for ${label}`}
-                            placeholderTextColor={colors.textMuted}
-                            value={templateFieldValues[i] ?? ''}
-                            onChangeText={(val) => {
-                              const next = [...templateFieldValues];
-                              next[i] = val;
-                              setTemplateFieldValues(next);
-                            }}
-                          />
-                        </View>
-                      ))
-                    )}
-                    {sendError && (
-                      <Text style={styles.sendError}>{sendError}</Text>
-                    )}
+                ) : (
+                  <>
                     <TouchableOpacity
-                      style={[styles.sendTemplateBtn, sending && styles.sendTemplateBtnDisabled]}
-                      onPress={handleSendTemplate}
-                      disabled={sending}
+                      style={styles.pillIconBtn}
+                      onPress={handleAttachmentPress}
+                      disabled={!canSendFreeText}
+                      hitSlop={6}
                     >
-                      {sending ? (
-                        <ActivityIndicator size="small" color="#fff" />
-                      ) : (
-                        <>
-                          <Ionicons name="send" size={18} color="#fff" />
-                          <Text style={styles.sendTemplateBtnText}>Send</Text>
-                        </>
-                      )}
+                      <Ionicons
+                        name="attach"
+                        size={22}
+                        color={canSendFreeText ? styles.pillIcon.color : styles.pillIconDisabled.color}
+                      />
                     </TouchableOpacity>
-                  </ScrollView>
+                    <TouchableOpacity
+                      style={styles.pillIconBtn}
+                      onPress={handlePickImage}
+                      disabled={!canSendFreeText}
+                      hitSlop={6}
+                    >
+                      <Ionicons
+                        name="camera-outline"
+                        size={22}
+                        color={canSendFreeText ? styles.pillIcon.color : styles.pillIconDisabled.color}
+                      />
+                    </TouchableOpacity>
+                  </>
                 )}
               </View>
-            </TouchableWithoutFeedback>
+            )}
+
+            {composerTemplateMode && (
+              <TouchableOpacity style={styles.pillIconBtn} onPress={openTemplateModal} hitSlop={6}>
+                <Ionicons name="document-text-outline" size={22} color={styles.pillIcon.color} />
+              </TouchableOpacity>
+            )}
           </View>
-        </TouchableWithoutFeedback>
-      </Modal>
+
+          {composerTemplateMode ? (
+            <TouchableOpacity style={styles.actionBtn} onPress={openTemplateModal} activeOpacity={0.85}>
+              <Ionicons name="send" size={20} color="#111B21" />
+            </TouchableOpacity>
+          ) : text.trim().length > 0 ? (
+            <TouchableOpacity style={styles.actionBtn} onPress={handleSendText} activeOpacity={0.85}>
+              <Ionicons name="send" size={20} color="#111B21" />
+            </TouchableOpacity>
+          ) : pendingVoiceUri ? (
+            <TouchableOpacity
+              style={[styles.actionBtn, voiceBusy && styles.actionBtnDisabled]}
+              onPress={handleSendPendingVoice}
+              disabled={voiceBusy}
+              activeOpacity={0.85}
+            >
+              {voiceBusy ? (
+                <ActivityIndicator size="small" color="#111B21" />
+              ) : (
+                <Ionicons name="send" size={20} color="#111B21" />
+              )}
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity
+              style={[styles.actionBtn, recording && styles.actionBtnRecording]}
+              onPress={handleToggleVoiceRecord}
+              disabled={!canRecordVoiceNote && !recording}
+              activeOpacity={0.85}
+            >
+              <Ionicons name={recording ? 'stop' : 'mic'} size={22} color="#111B21" />
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+
+      {showEmojiPicker && !composerTemplateMode && emojiPanelHeight > 0 && (
+        <Animated.View style={{ height: emojiPanelAnim, overflow: 'hidden' }}>
+          <EmojiKeyboard
+            height={emojiPanelHeight}
+            safeAreaBottom={0}
+            onEmojiSelected={handleEmojiSelected}
+            onKeyboardPress={handleShowKeyboardFromEmoji}
+          />
+        </Animated.View>
+      )}
+
+      <TemplatePickerSheet
+        visible={showTemplateModal}
+        onClose={() => setShowTemplateModal(false)}
+        onRetry={openTemplateModal}
+        templatesLoading={templatesLoading}
+        templatesError={templatesError}
+        templates={templates}
+        selectedTemplate={selectedTemplate}
+        onSelectTemplate={onSelectTemplate}
+        onBackToList={goBackToTemplateList}
+        variables={variables}
+        templateFieldValues={templateFieldValues}
+        onFieldChange={(index, value) => {
+          const next = [...templateFieldValues];
+          next[index] = value;
+          setTemplateFieldValues(next);
+        }}
+        preview={preview}
+        sendError={sendError}
+        sending={sending}
+        onSend={handleSendTemplate}
+      />
     </>
   );
 }
 
-function createComposerStyles(colors: AppColors) {
+function createComposerStyles(colors: AppColors, isDark: boolean) {
+  const pillBg = isDark ? '#1F2C34' : '#FFFFFF';
+  const pillIconColor = isDark ? '#8696A0' : '#54656F';
+
   return StyleSheet.create({
-  countdownValue: {
+  composerRoot: {
+    paddingHorizontal: 8,
+    paddingTop: 4,
+    backgroundColor: 'transparent',
+  },
+  statusStrip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 6,
+    paddingHorizontal: 4,
+  },
+  statusChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    backgroundColor: isDark ? 'rgba(31,44,52,0.92)' : 'rgba(255,255,255,0.92)',
+    borderWidth: 1,
+    borderColor: isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
+    maxWidth: '100%',
+  },
+  statusChipText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    flexShrink: 1,
+  },
+  statusChipTimer: {
+    fontSize: 12,
     fontWeight: '700',
-    fontSize: 12,
   },
-  infoBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    backgroundColor: colors.backgroundSecondary,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
-  },
-  infoBarLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flex: 1,
-  },
-  infoIconWrap: {
-    marginRight: 10,
-  },
-  infoTextBlock: {
-    flex: 1,
-  },
-  infoTitle: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: colors.text,
-  },
-  infoSubtitle: {
-    fontSize: 12,
-    color: colors.textMuted,
-    marginTop: 2,
-  },
-  infoButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.primary,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 8,
-  },
-  infoButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#fff',
-    marginLeft: 4,
-  },
-  inputBar: {
+  inputRow: {
     flexDirection: 'row',
     alignItems: 'flex-end',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: colors.backgroundSecondary,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
+    gap: 8,
+  },
+  inputPill: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    minHeight: 52,
+    maxHeight: 124,
+    borderRadius: 26,
+    backgroundColor: pillBg,
+    paddingLeft: 4,
+    paddingRight: 6,
+    paddingVertical: 6,
+    borderWidth: 1,
+    borderColor: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: isDark ? 0.28 : 0.1,
+        shadowRadius: 4,
+      },
+      android: {
+        elevation: 3,
+      },
+    }),
+  },
+  pillIconBtn: {
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pillIcon: {
+    color: pillIconColor,
+  },
+  pillIconDisabled: {
+    color: isDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.2)',
+  },
+  pillInputArea: {
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 40,
+    paddingHorizontal: 8,
+  },
+  pillTrailing: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  input: {
+    flex: 1,
+    fontSize: 16,
+    color: colors.text,
+    paddingHorizontal: 8,
+    paddingTop: Platform.OS === 'ios' ? 10 : 8,
+    paddingBottom: Platform.OS === 'ios' ? 10 : 8,
+    maxHeight: 100,
+    minHeight: 40,
+  },
+  inputPlaceholder: {
+    fontSize: 16,
+    color: colors.textMuted,
+  },
+  actionBtn: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: '#25D366',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 0,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.18,
+        shadowRadius: 3,
+      },
+      android: {
+        elevation: 4,
+      },
+    }),
+  },
+  actionBtnDisabled: {
+    opacity: 0.7,
+  },
+  actionBtnRecording: {
+    backgroundColor: '#EA4335',
+  },
+  recordingPillContent: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 10,
+    minHeight: 40,
+  },
+  recordingPillText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  recordingPillHint: {
+    fontSize: 12,
+    color: colors.textMuted,
+    flexShrink: 1,
+  },
+  recordingDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#FF3B30',
   },
   replyBar: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    marginHorizontal: 8,
+    marginBottom: 4,
     paddingHorizontal: 12,
-    paddingTop: 10,
-    paddingBottom: 6,
-    backgroundColor: colors.backgroundSecondary,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: colors.border,
+    paddingVertical: 8,
+    borderRadius: 14,
+    backgroundColor: isDark ? 'rgba(31,44,52,0.9)' : 'rgba(255,255,255,0.94)',
+    borderWidth: 1,
+    borderColor: isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.08,
+        shadowRadius: 3,
+      },
+      android: {
+        elevation: 2,
+      },
+    }),
   },
   replyBarLeft: {
     flexDirection: 'row',
@@ -931,240 +1099,6 @@ function createComposerStyles(colors: AppColors) {
   },
   replyCloseBtn: {
     padding: 6,
-  },
-  inputIconBtn: {
-    paddingHorizontal: 6,
-    paddingBottom: 6,
-  },
-  recordingInline: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  recordingDot: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    backgroundColor: '#FF3B30',
-  },
-  recordingInlineText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: colors.textMuted,
-  },
-  inputBox: {
-    flex: 1,
-    backgroundColor: colors.background,
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    marginHorizontal: 8,
-    minHeight: 40,
-    maxHeight: 100,
-    justifyContent: 'center',
-  },
-  input: {
-    fontSize: 16,
-    color: colors.text,
-    paddingVertical: 0,
-    maxHeight: 80,
-  },
-  inputPlaceholder: {
-    fontSize: 16,
-    color: colors.textMuted,
-  },
-  sendBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: colors.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sendBtnDisabled: {
-    opacity: 0.7,
-  },
-  voicePreviewActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    paddingBottom: 2,
-  },
-  voiceDeleteBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: colors.background,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-    justifyContent: 'flex-end',
-  },
-  modalSheet: {
-    backgroundColor: colors.background,
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
-    height: '92%',
-    maxHeight: '92%',
-    minHeight: 400,
-  },
-  modalHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 14,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
-  },
-  modalBackBtn: {
-    padding: 4,
-    marginRight: 8,
-  },
-  modalTitle: {
-    flex: 1,
-    fontSize: 18,
-    fontWeight: '700',
-    color: colors.text,
-  },
-  modalCloseBtn: {
-    padding: 4,
-  },
-  modalCenter: {
-    padding: 24,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  modalError: {
-    fontSize: 14,
-    color: colors.error,
-  },
-  modalEmpty: {
-    fontSize: 14,
-    color: colors.textMuted,
-  },
-  templateList: {
-    flex: 1,
-  },
-  templateItem: {
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
-  },
-  templateItemName: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: colors.text,
-  },
-  templateItemLang: {
-    fontSize: 12,
-    color: colors.textMuted,
-    marginTop: 2,
-  },
-  templateForm: {
-    flex: 1,
-  },
-  templateFormContent: {
-    padding: 16,
-    paddingBottom: 32,
-  },
-  previewSection: {
-    marginBottom: 20,
-  },
-  previewLabel: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: colors.textMuted,
-    marginBottom: 8,
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-  },
-  previewBubble: {
-    backgroundColor: colors.chatBubbleOut,
-    borderRadius: 12,
-    borderBottomRightRadius: 4,
-    padding: 14,
-    maxWidth: '100%',
-  },
-  previewHeader: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: colors.text,
-    marginBottom: 6,
-  },
-  previewBody: {
-    fontSize: 15,
-    color: colors.text,
-    lineHeight: 22,
-  },
-  previewFooter: {
-    fontSize: 12,
-    color: colors.textMuted,
-    marginTop: 8,
-  },
-  previewPlaceholder: {
-    fontSize: 14,
-    color: colors.textMuted,
-    fontStyle: 'italic',
-  },
-  fieldsSectionLabel: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: colors.textMuted,
-    marginBottom: 12,
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-  },
-  templateNoVars: {
-    fontSize: 14,
-    color: colors.textMuted,
-    marginBottom: 16,
-  },
-  fieldWrap: {
-    marginBottom: 16,
-  },
-  fieldLabel: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: colors.text,
-    marginBottom: 6,
-  },
-  fieldInput: {
-    backgroundColor: colors.backgroundSecondary,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    fontSize: 16,
-    color: colors.text,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  sendError: {
-    fontSize: 13,
-    color: colors.error,
-    marginBottom: 12,
-  },
-  sendTemplateBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: colors.primary,
-    paddingVertical: 14,
-    borderRadius: 12,
-    gap: 8,
-  },
-  sendTemplateBtnDisabled: {
-    opacity: 0.7,
-  },
-  sendTemplateBtnText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#fff',
   },
   });
 }

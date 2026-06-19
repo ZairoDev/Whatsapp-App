@@ -3,18 +3,21 @@ import {
   ActivityIndicator,
   FlatList,
   Image,
+  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
   TouchableWithoutFeedback,
+  useWindowDimensions,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { Ionicons } from '@expo/vector-icons';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useAuthStore } from '../../auth/auth.store';
 import { useChatStore } from '../chat.store';
 import {
@@ -48,36 +51,21 @@ import { GuestOutboundStatsBadges } from '../components/GuestOutboundStatsBadges
 
 type Props = NativeStackScreenProps<ChatAppStackParamList, 'ConversationList'>;
 
-const FILTER_TABS = ['All', 'Unread', 'Favourites', 'Labels'] as const;
+const FILTER_TABS = ['All', 'Unread', 'Favourites'] as const;
 
 type FilterTab = (typeof FILTER_TABS)[number];
 
-function getInitials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length >= 2) {
-    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase().slice(0, 2);
-  }
-  return (name.trim().slice(0, 2) || '?').toUpperCase();
-}
-
-function formatListDate(ts?: number): string {
-  if (!ts) return '';
-  const d = new Date(ts);
-  const now = new Date();
-  const isThisYear = d.getFullYear() === now.getFullYear();
-  if (isThisYear) {
-    return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
-  }
-  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: '2-digit' });
-}
-
-function escapeRegExp(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+import { getInitials, formatListDate, escapeRegExp } from './conversationListScreen.utils';
 
 export function ConversationListScreen({ route, navigation }: Props) {
-  const { colors } = useTheme();
-  const styles = useMemo(() => createStyles(colors), [colors]);
+  const { colors, isDark } = useTheme();
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
+  const newChatSheetMaxHeight = Math.min(windowHeight * 0.9, 640);
+  const styles = useMemo(
+    () => createStyles(colors, insets.top, insets.bottom, isDark, newChatSheetMaxHeight),
+    [colors, insets.top, insets.bottom, isDark, newChatSheetMaxHeight],
+  );
   const tokenData = useAuthStore((s) => s.tokenData);
   const { conversations, setConversations, appendConversations, phoneConfigs, setPhoneConfigs, archivedCount, setArchivedCount } = useChatStore();
   const [loading, setLoading] = useState(false);
@@ -103,7 +91,7 @@ export function ConversationListScreen({ route, navigation }: Props) {
    * When true, fetch conversations with no participantLocationKey (admin queue).
    * Only shown to full-access roles (SuperAdmin / Admin / Developer).
    */
-  const [adminQueue, setAdminQueue] = useState(false);
+  const [adminQueue, setAdminQueue] = useState(() => Boolean(route.params?.initialAdminQueue));
   const [monthlyTargetCities, setMonthlyTargetCities] = useState<string[]>([]);
   const [showLocationFilterModal, setShowLocationFilterModal] = useState(false);
   const [avatarPreviewUri, setAvatarPreviewUri] = useState<string | null>(null);
@@ -599,108 +587,95 @@ export function ConversationListScreen({ route, navigation }: Props) {
       </View>
     ) : null;
 
-  const listHeader = (
-    <>
-      <View style={styles.titleRow}>
-        <Text style={styles.title}>WhatsApp</Text>
-        <View style={styles.titleIcons}>
-          <TouchableOpacity style={styles.iconBtn} hitSlop={8} onPress={openNewChat}>
-            <Ionicons name="person-add-outline" size={22} color={colors.primary} />
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.iconBtn} hitSlop={8}>
-            <Ionicons name="create-outline" size={22} color={colors.textMuted} />
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.iconBtn} hitSlop={8}>
-            <Ionicons name="ellipsis-vertical" size={20} color={colors.textMuted} />
-          </TouchableOpacity>
-        </View>
-      </View>
+  const locationChipActive = adminQueue || locationFilter !== 'all';
+  const locationChipLabel = adminQueue
+    ? 'Admin queue'
+    : locationFilter === 'all'
+      ? 'Locations'
+      : formatLocationLabel(locationFilter, locationOptions);
 
+  const listScrollHeader = (
+    <>
       <View style={styles.searchWrap}>
-        <Ionicons name="search" size={20} color={colors.textMuted} style={styles.searchIcon} />
+        <Ionicons name="search" size={18} color={styles.searchIconColor.color} style={styles.searchIcon} />
         <TextInput
           style={styles.searchInput}
           placeholder="Search by name, phone or message"
-          placeholderTextColor={colors.textMuted}
+          placeholderTextColor={styles.searchPlaceholderColor.color}
           value={searchQuery}
           onChangeText={setSearchQuery}
         />
       </View>
 
-      <View style={styles.tabsRow}>
-        <View style={styles.tabsLeft}>
-          {FILTER_TABS.map((tab) => (
-            <TouchableOpacity
-              key={tab}
-              style={[styles.tab, activeFilter === tab && styles.tabActive]}
-              onPress={() => setActiveFilter(tab)}
-            >
-              <Text style={[styles.tabText, activeFilter === tab && styles.tabTextActive]}>
-                {tab}
-              </Text>
-              {tab === 'Labels' && (
-                <Ionicons
-                  name="chevron-down"
-                  size={14}
-                  color={colors.textMuted}
-                  style={styles.tabChevron}
-                />
-              )}
-            </TouchableOpacity>
-          ))}
-        </View>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.chipsScroll}
+        keyboardShouldPersistTaps="handled"
+        style={styles.chipsRow}
+      >
+        {FILTER_TABS.map((tab) => (
+          <TouchableOpacity
+            key={tab}
+            style={[styles.chip, activeFilter === tab && styles.chipActive]}
+            onPress={() => setActiveFilter(tab)}
+            activeOpacity={0.7}
+          >
+            <Text style={[styles.chipText, activeFilter === tab && styles.chipTextActive]}>
+              {tab}
+            </Text>
+          </TouchableOpacity>
+        ))}
 
         <Pressable
           onPress={() => setShowLocationFilterModal(true)}
           accessibilityRole="button"
           accessibilityLabel="Filter by location"
-          style={({ pressed }) => [styles.locationFilterBtn, pressed && styles.locationFilterBtnPressed]}
-          hitSlop={8}
-        >
-          <Ionicons name="location-outline" size={16} color={colors.primary} />
-          <Text style={styles.locationFilterText}>
-            {adminQueue
-              ? 'Admin queue'
-              : locationFilter === 'all'
-                ? 'All my locations'
-                : formatLocationLabel(locationFilter, locationOptions)}
-          </Text>
-          <Ionicons name="chevron-down" size={14} color={colors.textMuted} />
-        </Pressable>
-      </View>
-
-      {/* Admin queue toggle — only shown to full-access roles */}
-      {hasFullLocationAccess(tokenData?.role) && (
-        <TouchableOpacity
-          style={[styles.adminQueueRow, adminQueue && styles.adminQueueRowActive]}
-          activeOpacity={0.7}
-          onPress={() => {
-            setAdminQueue((prev) => !prev);
-            setLocationFilter('all');
-          }}
+          style={({ pressed }) => [
+            styles.chip,
+            styles.locationFilterChip,
+            locationChipActive && styles.chipActive,
+            pressed && styles.chipPressed,
+          ]}
         >
           <Ionicons
-            name={adminQueue ? 'albums' : 'albums-outline'}
-            size={18}
-            color={adminQueue ? '#fff' : colors.textMuted}
+            name="location-outline"
+            size={14}
+            color={locationChipActive ? styles.chipTextActive.color : styles.chipText.color}
           />
-          <Text style={[styles.adminQueueText, adminQueue && styles.adminQueueTextActive]}>
-            Admin queue
+          <Text
+            style={[styles.chipText, locationChipActive && styles.chipTextActive]}
+            numberOfLines={1}
+          >
+            {locationChipLabel}
           </Text>
-          {adminQueue && (
-            <View style={styles.adminQueueBadge}>
-              <Text style={styles.adminQueueBadgeText}>ON</Text>
-            </View>
-          )}
-        </TouchableOpacity>
-      )}
+          <Ionicons
+            name="chevron-down"
+            size={14}
+            color={locationChipActive ? styles.chipTextActive.color : styles.chipText.color}
+          />
+        </Pressable>
+
+        {hasFullLocationAccess(tokenData?.role) && (
+          <TouchableOpacity
+            style={[styles.chip, adminQueue && styles.chipActive]}
+            activeOpacity={0.7}
+            onPress={() => {
+              setAdminQueue((prev) => !prev);
+              setLocationFilter('all');
+            }}
+          >
+            <Text style={[styles.chipText, adminQueue && styles.chipTextActive]}>Admin queue</Text>
+          </TouchableOpacity>
+        )}
+      </ScrollView>
 
       <TouchableOpacity
         style={styles.archivedRow}
         activeOpacity={0.7}
         onPress={() => navigation.navigate('ArchiveList', { defaultArea })}
       >
-        <Ionicons name="archive-outline" size={22} color={colors.textMuted} />
+        <Ionicons name="archive-outline" size={20} color={colors.textMuted} />
         <Text style={styles.archivedText}>Archived</Text>
         {archivedCount > 0 && (
           <View style={styles.archivedCount}>
@@ -786,124 +761,143 @@ export function ConversationListScreen({ route, navigation }: Props) {
       <Modal
         visible={showNewChatModal}
         transparent
-        animationType="fade"
+        animationType="slide"
         onRequestClose={() => setShowNewChatModal(false)}
       >
-        <TouchableWithoutFeedback onPress={() => setShowNewChatModal(false)}>
-          <View style={styles.modalOverlay}>
-            <TouchableWithoutFeedback>
-              <View style={styles.modalCard}>
-                <Text style={styles.modalTitle}>Start a new chat</Text>
-                <Text style={styles.modalSubtitle}>Choose Owner/Guest, location, and phone number</Text>
+        <View style={styles.newChatOverlay}>
+          <Pressable
+            style={styles.newChatBackdrop}
+            onPress={() => setShowNewChatModal(false)}
+            accessibilityRole="button"
+            accessibilityLabel="Close new chat"
+          />
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.newChatSheetWrap}
+          >
+            <View style={styles.newChatSheet}>
+              <View style={styles.newChatHandle} />
 
-                <View style={styles.typeRow}>
-                  <Pressable
-                    onPress={() => setNewContactType('owner')}
-                    style={({ pressed }) => [
-                      styles.typePill,
-                      newContactType === 'owner' && styles.typePillActive,
-                      pressed && styles.typePillPressed,
-                    ]}
-                    accessibilityRole="button"
-                    accessibilityLabel="Add owner"
-                  >
-                    <Text
-                      style={[
-                        styles.typePillText,
-                        newContactType === 'owner' && styles.typePillTextActive,
+              <View style={styles.newChatHeader}>
+                <Pressable
+                  onPress={() => setShowNewChatModal(false)}
+                  style={({ pressed }) => [styles.newChatHeaderBtn, pressed && styles.chipPressed]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Close"
+                  hitSlop={8}
+                >
+                  <Ionicons name="close" size={24} color={styles.headerIconColor.color} />
+                </Pressable>
+                <Text style={styles.newChatHeaderTitle}>New chat</Text>
+                <View style={styles.newChatHeaderBtn} />
+              </View>
+
+              <ScrollView
+                style={styles.newChatBody}
+                contentContainerStyle={styles.newChatBodyContent}
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
+                bounces={false}
+              >
+                <Text style={[styles.newChatSectionLabel, styles.newChatSectionLabelFirst]}>Contact type</Text>
+                <View style={styles.newChatTypeRow}>
+                  {(['owner', 'guest'] as const).map((type) => (
+                    <Pressable
+                      key={type}
+                      onPress={() => setNewContactType(type)}
+                      style={({ pressed }) => [
+                        styles.chip,
+                        newContactType === type && styles.chipActive,
+                        pressed && styles.chipPressed,
                       ]}
+                      accessibilityRole="button"
+                      accessibilityLabel={type === 'owner' ? 'Add owner' : 'Add guest'}
                     >
-                      Owner
-                    </Text>
-                  </Pressable>
-                  <Pressable
-                    onPress={() => setNewContactType('guest')}
-                    style={({ pressed }) => [
-                      styles.typePill,
-                      newContactType === 'guest' && styles.typePillActive,
-                      pressed && styles.typePillPressed,
-                    ]}
-                    accessibilityRole="button"
-                    accessibilityLabel="Add guest"
-                  >
-                    <Text
-                      style={[
-                        styles.typePillText,
-                        newContactType === 'guest' && styles.typePillTextActive,
-                      ]}
-                    >
-                      Guest
-                    </Text>
-                  </Pressable>
+                      <Text
+                        style={[
+                          styles.chipText,
+                          newContactType === type && styles.chipTextActive,
+                        ]}
+                      >
+                        {type === 'owner' ? 'Owner' : 'Guest'}
+                      </Text>
+                    </Pressable>
+                  ))}
                 </View>
 
-                <View style={styles.modalFieldFull}>
-                  <Text style={styles.modalLabel}>Name (optional)</Text>
+                <Text style={styles.newChatSectionLabel}>Name</Text>
+                <View style={styles.newChatFieldGroup}>
                   <TextInput
-                    style={styles.modalInput}
+                    style={styles.newChatFieldInput}
                     value={newContactName}
                     onChangeText={setNewContactName}
-                    placeholder={newContactType === 'guest' ? 'Guest name' : 'Owner name'}
-                    placeholderTextColor={colors.textMuted}
+                    placeholder={newContactType === 'guest' ? 'Guest name (optional)' : 'Owner name (optional)'}
+                    placeholderTextColor={styles.searchPlaceholderColor.color}
                     autoCorrect={false}
                     autoCapitalize="words"
                   />
                 </View>
 
-                <View style={styles.locationRow}>
-                  <Text style={styles.modalLabel}>Location</Text>
-                  <View style={styles.locationChips}>
-                    {locationOptions.map((loc) => {
-                      const locKey = normalizeLocationKey(loc);
-                      return (
-                        <Pressable
-                          key={locKey}
-                          onPress={() => setNewContactLocation(locKey)}
-                          style={({ pressed }) => [
-                            styles.locationChip,
-                            newContactLocation === locKey && styles.locationChipActive,
-                            pressed && styles.locationChipPressed,
-                          ]}
-                          accessibilityRole="button"
-                          accessibilityLabel={`Set location ${loc}`}
+                <Text style={styles.newChatSectionLabel}>Location</Text>
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  nestedScrollEnabled
+                  contentContainerStyle={styles.newChatLocationScroll}
+                  keyboardShouldPersistTaps="handled"
+                >
+                  {locationOptions.map((loc) => {
+                    const locKey = normalizeLocationKey(loc);
+                    const selected = newContactLocation === locKey;
+                    return (
+                      <Pressable
+                        key={locKey}
+                        onPress={() => setNewContactLocation(locKey)}
+                        style={({ pressed }) => [
+                          styles.chip,
+                          styles.newChatLocationChip,
+                          selected && styles.chipActive,
+                          pressed && styles.chipPressed,
+                        ]}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Set location ${loc}`}
+                      >
+                        <Ionicons
+                          name="location-outline"
+                          size={14}
+                          color={selected ? styles.chipTextActive.color : styles.chipText.color}
+                        />
+                        <Text
+                          style={[styles.chipText, selected && styles.chipTextActive]}
+                          numberOfLines={1}
                         >
-                          <Ionicons name="location-outline" size={14} color={colors.textSecondary} />
-                          <Text
-                            style={[
-                              styles.locationChipText,
-                              newContactLocation === locKey && styles.locationChipTextActive,
-                            ]}
-                          >
-                            {loc}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </View>
+                          {loc}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
 
-                <View style={styles.modalRow}>
-                  <View style={styles.modalFieldSmall}>
-                    <Text style={styles.modalLabel}>Country</Text>
+                <Text style={styles.newChatSectionLabel}>Phone number</Text>
+                <View style={styles.newChatFieldGroup}>
+                  <View style={styles.newChatPhoneRow}>
                     <TextInput
-                      style={styles.modalInput}
+                      style={styles.newChatCountryInput}
                       value={countryCode}
                       onChangeText={(v) => setCountryCode(v.startsWith('+') ? v : `+${v}`)}
-                      placeholder="+1"
-                      placeholderTextColor={colors.textMuted}
+                      placeholder="+30"
+                      placeholderTextColor={styles.searchPlaceholderColor.color}
                       keyboardType="phone-pad"
                       autoCorrect={false}
                       autoCapitalize="none"
                     />
-                  </View>
-                  <View style={styles.modalField}>
-                    <Text style={styles.modalLabel}>Phone</Text>
+                    <View style={styles.newChatPhoneDivider} />
                     <TextInput
-                      style={styles.modalInput}
+                      style={styles.newChatPhoneInput}
                       value={phoneNumber}
                       onChangeText={setPhoneNumber}
                       placeholder="Phone number"
-                      placeholderTextColor={colors.textMuted}
+                      placeholderTextColor={styles.searchPlaceholderColor.color}
                       keyboardType="phone-pad"
                       autoCorrect={false}
                       autoCapitalize="none"
@@ -911,27 +905,33 @@ export function ConversationListScreen({ route, navigation }: Props) {
                   </View>
                 </View>
 
-                {newChatError && <Text style={styles.modalError}>{newChatError}</Text>}
+                {newChatError ? <Text style={styles.newChatError}>{newChatError}</Text> : null}
 
-                <View style={styles.modalActions}>
-                  <TouchableOpacity
-                    style={[styles.modalBtn, styles.modalBtnSecondary]}
-                    onPress={() => setShowNewChatModal(false)}
-                  >
-                    <Text style={styles.modalBtnSecondaryText}>Cancel</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={[styles.modalBtn, styles.modalBtnPrimary]} onPress={startChatWithNumber}>
-                    <Text style={styles.modalBtnPrimaryText}>Continue</Text>
-                  </TouchableOpacity>
-                </View>
+                <Text style={styles.newChatHint}>
+                  Enter a WhatsApp number to start messaging. Templates are available if the 24-hour window has expired.
+                </Text>
+              </ScrollView>
+
+              <View style={styles.newChatFooter}>
+                <Pressable
+                  onPress={startChatWithNumber}
+                  style={({ pressed }) => [
+                    styles.newChatContinueBtn,
+                    pressed && styles.newChatContinueBtnPressed,
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Continue to chat"
+                >
+                  <Text style={styles.newChatContinueText}>Continue</Text>
+                </Pressable>
               </View>
-            </TouchableWithoutFeedback>
-          </View>
-        </TouchableWithoutFeedback>
+            </View>
+          </KeyboardAvoidingView>
+        </View>
       </Modal>
 
-      <SafeAreaView edges={['top']} style={styles.selectionSafeArea}>
-        {isSelectionMode && (
+      {isSelectionMode && (
+        <SafeAreaView edges={['top']} style={styles.selectionSafeArea}>
           <View style={styles.selectionBar}>
             <TouchableOpacity
               style={styles.selectionBackBtn}
@@ -961,10 +961,23 @@ export function ConversationListScreen({ route, navigation }: Props) {
               </TouchableOpacity>
             </View>
           </View>
-        )}
-      </SafeAreaView>
+        </SafeAreaView>
+      )}
 
       <View style={styles.content}>
+        {!isSelectionMode && (
+          <View style={styles.titleRow}>
+            <Text style={styles.title}>Adminstro</Text>
+            <View style={styles.titleIcons}>
+              <TouchableOpacity style={styles.iconBtn} hitSlop={8}>
+                <Ionicons name="camera-outline" size={24} color={styles.headerIconColor.color} />
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.iconBtn} hitSlop={8}>
+                <Ionicons name="ellipsis-vertical" size={22} color={styles.headerIconColor.color} />
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
         {loading && (
           <View style={styles.center}>
             <ActivityIndicator size="small" color={colors.primary} />
@@ -973,7 +986,6 @@ export function ConversationListScreen({ route, navigation }: Props) {
         {error && !loading && <Text style={styles.error}>{error}</Text>}
         {!loading && !error && (
           <>
-            {listHeader}
             {searchQuery.trim() ? (
               <>
                 {searchLoading && (
@@ -985,16 +997,16 @@ export function ConversationListScreen({ route, navigation }: Props) {
                   <Text style={styles.error}>{searchError}</Text>
                 )}
                 {!searchLoading && !searchError && (
-                  <>
-                    {searchResults.length === 0 ? (
-                      <Text style={styles.empty}>No results</Text>
-                    ) : (
-                      <FlatList
-                        data={searchResults}
-                        keyExtractor={(item, index) =>
-                          item.id ? `${item.id}` : `search-${index}`
-                        }
-                        renderItem={({ item }) => (
+                  <FlatList
+                    style={styles.list}
+                    data={searchResults}
+                    keyExtractor={(item, index) =>
+                      item.id ? `${item.id}` : `search-${index}`
+                    }
+                    ListHeaderComponent={listScrollHeader}
+                    ListEmptyComponent={<Text style={styles.empty}>No results</Text>}
+                    keyboardShouldPersistTaps="handled"
+                    renderItem={({ item }) => (
                           <TouchableOpacity
                             style={styles.row}
                             activeOpacity={0.7}
@@ -1086,46 +1098,67 @@ export function ConversationListScreen({ route, navigation }: Props) {
                             </View>
                           </TouchableOpacity>
                         )}
-                      />
-                    )}
-                  </>
-                )}
-              </>
-            ) : (
-              <>
-                {filteredConversations.length === 0 ? (
-                  <Text style={styles.empty}>No conversations yet</Text>
-                ) : (
-                  <FlatList
-                    data={filteredConversations}
-                    keyExtractor={(item, index) =>
-                      (item.id ? `${item.id}` : `conv-${index}`) + `-${index}`
-                    }
-                    renderItem={renderRow}
-                    onEndReached={loadMore}
-                    onEndReachedThreshold={0.3}
-                    ListFooterComponent={renderFooter}
-                    maintainVisibleContentPosition={{
-                      minIndexForVisible: 0,
-                      autoscrollToTopThreshold: 20,
-                    }}
-                    keyboardShouldPersistTaps="handled"
                   />
                 )}
               </>
+            ) : (
+              <FlatList
+                style={styles.list}
+                data={filteredConversations}
+                keyExtractor={(item, index) =>
+                  (item.id ? `${item.id}` : `conv-${index}`) + `-${index}`
+                }
+                renderItem={renderRow}
+                ListHeaderComponent={listScrollHeader}
+                ListEmptyComponent={<Text style={styles.empty}>No conversations yet</Text>}
+                onEndReached={loadMore}
+                onEndReachedThreshold={0.3}
+                ListFooterComponent={renderFooter}
+                maintainVisibleContentPosition={{
+                  minIndexForVisible: 0,
+                  autoscrollToTopThreshold: 20,
+                }}
+                keyboardShouldPersistTaps="handled"
+              />
             )}
           </>
         )}
       </View>
+
+      {!isSelectionMode && !loading && (
+        <TouchableOpacity
+          style={styles.newChatFab}
+          onPress={openNewChat}
+          activeOpacity={0.85}
+          accessibilityRole="button"
+          accessibilityLabel="Start a new chat"
+        >
+          <MaterialCommunityIcons
+            name={isDark ? 'message-plus' : 'message-plus-outline'}
+            size={28}
+            color={isDark ? '#111B21' : '#fff'}
+          />
+        </TouchableOpacity>
+      )}
     </View>
   );
 }
 
-function createStyles(colors: AppColors) {
+/* v8 ignore start -- style factory; validated visually, not unit-tested */
+function createStyles(
+  colors: AppColors,
+  safeAreaTop: number,
+  safeAreaBottom: number,
+  isDark: boolean,
+  newChatSheetMaxHeight: number,
+) {
   return StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
+  },
+  list: {
+    flex: 1,
   },
   selectionSafeArea: {
     backgroundColor: colors.chatHeader,
@@ -1159,142 +1192,124 @@ function createStyles(colors: AppColors) {
     paddingHorizontal: 16,
   },
   titleRow: {
-    paddingTop: 40,
+    paddingTop: safeAreaTop + 5,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: 12,
+    paddingBottom: 10,
   },
   title: {
-    fontSize: 28,
+    fontSize: 32,
     fontWeight: '700',
-    color: colors.text,
+    letterSpacing: -0.5,
+    color: isDark ? '#FFFFFF' : '#1DAA61',
   },
   titleIcons: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: 20,
+  },
+  headerIconColor: {
+    color: isDark ? colors.text : '#111B21',
   },
   iconBtn: {
-    padding: 4,
+    padding: 2,
+  },
+  newChatFab: {
+    position: 'absolute',
+    right: 16,
+    bottom: Math.max(safeAreaBottom, 12) + 12,
+    width: 56,
+    height: 56,
+    borderRadius: 14,
+    backgroundColor: isDark ? '#FFFFFF' : colors.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.25,
+        shadowRadius: 4,
+      },
+      android: {
+        elevation: 6,
+      },
+    }),
   },
   searchWrap: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: colors.backgroundSecondary,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    marginBottom: 12,
-    minHeight: 40,
+    backgroundColor: isDark ? colors.surface : '#F0F2F5',
+    borderRadius: 22,
+    paddingHorizontal: 14,
+    marginTop: 2,
+    marginBottom: 10,
+    minHeight: 38,
   },
   searchIcon: {
     marginRight: 10,
   },
+  searchIconColor: {
+    color: isDark ? colors.textMuted : '#8696A0',
+  },
+  searchPlaceholderColor: {
+    color: isDark ? colors.textMuted : '#8696A0',
+  },
   searchInput: {
     flex: 1,
-    fontSize: 16,
+    fontSize: 15,
     color: colors.text,
-    paddingVertical: 8,
+    paddingVertical: Platform.OS === 'ios' ? 9 : 7,
   },
-  tabsRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
+  chipsRow: {
     marginBottom: 8,
-    gap: 4,
-    justifyContent: 'space-between',
   },
-  tabsLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    flex: 1,
-    minWidth: 0,
-  },
-  locationFilterBtn: {
+  chipsScroll: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.backgroundSecondary,
-    maxWidth: 190,
+    paddingRight: 8,
   },
-  locationFilterBtnPressed: {
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: isDark ? 'rgba(255,255,255,0.12)' : '#E9EDEF',
+    backgroundColor: isDark ? colors.surface : '#FFFFFF',
+  },
+  chipActive: {
+    backgroundColor: isDark ? 'rgba(37, 211, 102, 0.14)' : '#E7FCE8',
+    borderColor: isDark ? colors.primary : '#25D366',
+  },
+  chipPressed: {
     opacity: 0.85,
   },
-  locationFilterText: {
-    flexShrink: 1,
-    fontSize: 13,
-    fontWeight: '600',
-    color: colors.text,
+  locationFilterChip: {
+    gap: 5,
+    maxWidth: 180,
   },
-  tab: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 8,
-  },
-  tabActive: {
-    backgroundColor: colors.backgroundSecondary,
-  },
-  tabText: {
+  chipText: {
     fontSize: 14,
-    color: colors.textSecondary,
+    fontWeight: '500',
+    color: isDark ? colors.textSecondary : '#3B4A54',
   },
-  tabTextActive: {
-    color: colors.text,
+  chipTextActive: {
+    color: isDark ? colors.primary : '#008069',
     fontWeight: '600',
-  },
-  tabChevron: {
-    marginLeft: 2,
-  },
-  adminQueueRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    gap: 12,
-    backgroundColor: colors.backgroundSecondary,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
-  },
-  adminQueueRowActive: {
-    backgroundColor: '#128C7E',
-  },
-  adminQueueText: {
-    fontSize: 14,
-    color: colors.textSecondary,
-    flex: 1,
-  },
-  adminQueueTextActive: {
-    color: '#fff',
-    fontWeight: '600',
-  },
-  adminQueueBadge: {
-    backgroundColor: 'rgba(255,255,255,0.25)',
-    borderRadius: 8,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-  },
-  adminQueueBadgeText: {
-    color: '#fff',
-    fontSize: 11,
-    fontWeight: '700',
   },
   archivedRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 14,
-    gap: 14,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
+    paddingVertical: 10,
+    gap: 12,
+    marginBottom: 2,
   },
   archivedText: {
-    fontSize: 16,
+    fontSize: 15,
     color: colors.text,
     flex: 1,
   },
@@ -1341,16 +1356,15 @@ function createStyles(colors: AppColors) {
     marginTop: 8,
   },
   empty: {
-    fontSize: 16,
+    fontSize: 15,
     color: colors.textSecondary,
-    marginTop: 16,
+    marginTop: 12,
+    marginBottom: 16,
   },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
   },
   rowSelected: {
     backgroundColor: 'rgba(7, 94, 84, 0.08)',
@@ -1588,144 +1602,161 @@ function createStyles(colors: AppColors) {
     maxHeight: 420,
     resizeMode: 'cover',
   },
-  modalCard: {
-    backgroundColor: colors.background,
-    borderRadius: 16,
-    padding: 16,
-  },
-  typeRow: {
-    flexDirection: 'row',
-    gap: 10,
-    marginTop: 12,
-    marginBottom: 10,
-  },
-  typePill: {
+  newChatOverlay: {
     flex: 1,
-    borderRadius: 12,
-    paddingVertical: 10,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  newChatBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  newChatSheetWrap: {
+    maxHeight: newChatSheetMaxHeight,
+  },
+  newChatSheet: {
+    backgroundColor: colors.background,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    maxHeight: newChatSheetMaxHeight,
+    paddingBottom: Math.max(safeAreaBottom, 12),
+    overflow: 'hidden',
+    flexShrink: 1,
+  },
+  newChatHandle: {
+    alignSelf: 'center',
+    width: 36,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: isDark ? 'rgba(255,255,255,0.18)' : '#D1D7DB',
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  newChatHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 8,
+    paddingBottom: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+  },
+  newChatHeaderBtn: {
+    width: 44,
+    height: 44,
     alignItems: 'center',
     justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.backgroundSecondary,
-    minHeight: 44,
   },
-  typePillActive: {
-    backgroundColor: 'rgba(7, 94, 84, 0.10)',
-    borderColor: 'rgba(7, 94, 84, 0.24)',
-  },
-  typePillPressed: {
-    opacity: 0.85,
-  },
-  typePillText: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: colors.textSecondary,
-  },
-  typePillTextActive: {
-    color: colors.text,
-  },
-  modalTitle: {
+  newChatHeaderTitle: {
     fontSize: 18,
     fontWeight: '700',
     color: colors.text,
   },
-  modalSubtitle: {
-    marginTop: 4,
-    fontSize: 14,
-    color: colors.textSecondary,
+  newChatBody: {
+    flexGrow: 0,
+    flexShrink: 1,
   },
-  modalRow: {
-    flexDirection: 'row',
-    gap: 12,
+  newChatBodyContent: {
+    paddingHorizontal: 16,
+    paddingTop: 4,
+    paddingBottom: 12,
+  },
+  newChatSectionLabel: {
     marginTop: 14,
-  },
-  modalFieldSmall: {
-    width: 110,
-  },
-  modalField: {
-    flex: 1,
-  },
-  modalFieldFull: {
-    marginTop: 10,
-  },
-  modalLabel: {
-    fontSize: 12,
-    color: colors.textMuted,
-    marginBottom: 6,
-  },
-  locationRow: {
-    marginTop: 12,
-  },
-  locationChips: {
-    flexDirection: 'row',
-    gap: 10,
-    marginTop: 8,
-  },
-  locationChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.backgroundSecondary,
-    minHeight: 36,
-  },
-  locationChipActive: {
-    backgroundColor: 'rgba(7, 94, 84, 0.10)',
-    borderColor: 'rgba(7, 94, 84, 0.24)',
-  },
-  locationChipPressed: {
-    opacity: 0.85,
-  },
-  locationChipText: {
+    marginBottom: 8,
     fontSize: 13,
-    fontWeight: '700',
-    color: colors.textSecondary,
+    fontWeight: '600',
+    color: colors.textMuted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
   },
-  locationChipTextActive: {
-    color: colors.text,
+  newChatSectionLabelFirst: {
+    marginTop: 6,
   },
-  modalInput: {
-    backgroundColor: colors.backgroundSecondary,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+  newChatTypeRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  newChatFieldGroup: {
+    borderRadius: 12,
+    backgroundColor: isDark ? colors.surface : '#F0F2F5',
+    overflow: 'hidden',
+  },
+  newChatFieldInput: {
+    minHeight: 48,
+    paddingHorizontal: 14,
     fontSize: 16,
     color: colors.text,
+    paddingVertical: Platform.OS === 'ios' ? 12 : 10,
   },
-  modalError: {
-    marginTop: 10,
+  newChatLocationScroll: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingRight: 8,
+  },
+  newChatLocationChip: {
+    gap: 5,
+    maxWidth: 160,
+  },
+  newChatPhoneRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    minHeight: 48,
+  },
+  newChatCountryInput: {
+    width: 72,
+    paddingHorizontal: 14,
+    fontSize: 16,
+    color: colors.text,
+    paddingVertical: Platform.OS === 'ios' ? 12 : 10,
+    textAlign: 'center',
+  },
+  newChatPhoneDivider: {
+    width: StyleSheet.hairlineWidth,
+    alignSelf: 'stretch',
+    backgroundColor: colors.border,
+    marginVertical: 10,
+  },
+  newChatPhoneInput: {
+    flex: 1,
+    paddingHorizontal: 14,
+    fontSize: 16,
+    color: colors.text,
+    paddingVertical: Platform.OS === 'ios' ? 12 : 10,
+  },
+  newChatError: {
+    marginTop: 12,
     color: colors.error,
     fontSize: 13,
+    lineHeight: 18,
   },
-  modalActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 10,
-    marginTop: 16,
+  newChatHint: {
+    marginTop: 14,
+    fontSize: 13,
+    lineHeight: 18,
+    color: colors.textMuted,
   },
-  modalBtn: {
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 10,
+  newChatFooter: {
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
   },
-  modalBtnSecondary: {
-    backgroundColor: colors.backgroundSecondary,
+  newChatContinueBtn: {
+    minHeight: 48,
+    borderRadius: 24,
+    backgroundColor: isDark ? colors.primary : '#1DAA61',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  modalBtnPrimary: {
-    backgroundColor: colors.chatHeader,
+  newChatContinueBtnPressed: {
+    opacity: 0.88,
   },
-  modalBtnSecondaryText: {
-    color: colors.text,
-    fontWeight: '600',
-  },
-  modalBtnPrimaryText: {
-    color: '#fff',
+  newChatContinueText: {
+    color: '#FFFFFF',
+    fontSize: 16,
     fontWeight: '700',
   },
   });
 }
+/* v8 ignore end */

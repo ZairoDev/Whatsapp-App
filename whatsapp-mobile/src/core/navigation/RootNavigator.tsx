@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, AppState, AppStateStatus, StyleSheet, Text, View, ActivityIndicator } from 'react-native';
-import { NavigationContainer, DarkTheme, DefaultTheme } from '@react-navigation/native';
+import { NavigationContainer, DarkTheme, DefaultTheme, NavigatorScreenParams } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useAuthStore } from '../../features/auth/auth.store';
 import { LoginScreen, VerifyOtpScreen } from '../../features/auth/screens';
 import { DashboardScreen } from '../../features/dashboard/screens/DashboardScreen';
-import { ChatAppStack } from './ChatAppStack';
+import { ChatAppStack, type ChatAppStackParamList } from './ChatAppStack';
 import { useTheme } from '../../theme/ThemeContext';
 import api from '../../services/api';
 import { connectSocket, disconnectSocket } from '../../services';
@@ -29,7 +29,7 @@ export type AuthStackParamList = {
 
 export type RootStackParamList = {
   Main: undefined;
-  ChatApp: { initialArea?: string } | undefined;
+  ChatApp: NavigatorScreenParams<ChatAppStackParamList> | undefined;
 };
 
 const AuthStack = createNativeStackNavigator<AuthStackParamList>();

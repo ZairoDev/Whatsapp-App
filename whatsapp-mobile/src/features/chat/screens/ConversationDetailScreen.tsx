@@ -4,7 +4,7 @@ import {
   Alert,
   FlatList,
   Image,
-  KeyboardAvoidingView,
+  ImageBackground,
   Modal,
   Platform,
   Pressable,
@@ -40,6 +40,7 @@ import type { AppColors } from '../../../theme/palettes';
 import { useChatStore } from '../chat.store';
 import { joinConversationRoom, leaveConversationRoom } from '../../../services/socket';
 import { translateToEnglish } from '../../../services/translate';
+import { useChatKeyboard } from '../hooks/useChatKeyboard';
 
 type Props = NativeStackScreenProps<ChatAppStackParamList, 'ConversationDetail'>;
 
@@ -96,6 +97,9 @@ function getInitials(name?: string | null): string {
 // always return the SAME object, preventing Zustand snapshot infinite loops.
 const EMPTY_MESSAGES: Message[] = [];
 
+const CHAT_WALLPAPER_LIGHT = require('../../../../assets/Light.jpeg');
+const CHAT_WALLPAPER_DARK = require('../../../../assets/Dark.jpeg');
+
 export function ConversationDetailScreen({ route, navigation }: Props) {
   const {
     conversationId,
@@ -111,12 +115,18 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   } = route.params;
 
   const insets = useSafeAreaInsets();
+  const {
+    bottomInset,
+    lastKeyboardHeight,
+    lastKeyboardDuration,
+    onEmojiPickerOpenChange,
+  } = useChatKeyboard();
   const { colors, isDark } = useTheme();
-  const styles = useMemo(() => createDetailStyles(colors), [colors]);
+  const styles = useMemo(() => createDetailStyles(colors, isDark), [colors, isDark]);
   const ui = useMemo(
     () => ({
       bg: colors.chatWallpaper,
-      headerBg: colors.backgroundSecondary,
+      headerBg: colors.background,
       headerBorder: colors.border,
       text: colors.text,
       textMuted: colors.textMuted,
@@ -675,8 +685,8 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
     return (
       <View>
         {showDateChip && (
-          <View style={styles.dateChipWrap}>
-            <Text style={styles.dateChipText}>
+          <View style={[styles.dateChipWrap, { backgroundColor: ui.dateChipBg }]}>
+            <Text style={[styles.dateChipText, { color: ui.dateChipText }]}>
               {formatDateChip(item.timestamp) ?? ''}
             </Text>
           </View>
@@ -1217,12 +1227,115 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
   );
   // ------------------------------------------------------------------------------
 
-  return (
-    <KeyboardAvoidingView
-      style={[styles.container, { backgroundColor: ui.bg }]}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      keyboardVerticalOffset={0}
+  const chatShell = (
+    <ImageBackground
+      source={isDark ? CHAT_WALLPAPER_DARK : CHAT_WALLPAPER_LIGHT}
+      style={styles.chatArea}
+      resizeMode="cover"
+      imageStyle={styles.chatWallpaperImage}
     >
+      <View style={[styles.chatAreaInner, { paddingBottom: bottomInset }]}>
+        {loading && (
+          <View style={styles.center}>
+            <ActivityIndicator size="small" color={colors.primary} />
+          </View>
+        )}
+        {error && !loading && <Text style={styles.error}>{error}</Text>}
+        {!loading && !error && messages.length === 0 && (
+          <View style={styles.emptyChatState} pointerEvents="none">
+            <View style={[styles.dateChipWrap, { backgroundColor: ui.dateChipBg }]}>
+              <Text style={[styles.dateChipText, { color: ui.dateChipText }]}>Today</Text>
+            </View>
+            <View
+              style={[
+                styles.emptyChatBanner,
+                { backgroundColor: isDark ? 'rgba(31,44,52,0.94)' : 'rgba(255,249,196,0.95)' },
+              ]}
+            >
+              <Ionicons
+                name="chatbubble-ellipses-outline"
+                size={22}
+                color={isDark ? colors.primary : '#128C7E'}
+                style={styles.emptyChatBannerIcon}
+              />
+              <Text style={[styles.emptyChatBannerTitle, { color: ui.text }]}>
+                Start a conversation
+              </Text>
+              <Text style={[styles.emptyChatBannerSubtitle, { color: ui.textMuted }]}>
+                Send a Template to begin chatting with {headerTitle}.
+              </Text>
+            </View>
+          </View>
+        )}
+        {!loading && !error && (
+          <FlatList
+            data={messages}
+            keyExtractor={(item) => item.id}
+            renderItem={renderMessage}
+            inverted
+            onEndReached={loadOlder}
+            onEndReachedThreshold={0.3}
+            ListHeaderComponent={renderHeader}
+            contentContainerStyle={[
+              styles.listContent,
+              messages.length === 0 && styles.listContentEmpty,
+            ]}
+            style={styles.chatList}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+            removeClippedSubviews={Platform.OS === 'android'}
+            initialNumToRender={14}
+            maxToRenderPerBatch={14}
+            windowSize={10}
+          />
+        )}
+
+        <MessageComposer
+          conversationId={conversationId}
+          participantPhone={participantPhone}
+          area={area}
+          businessPhoneId={conversationFromStore?.businessPhoneId}
+          replyTo={
+            replyTarget && replyPreview
+              ? {
+                  id: replyTarget.id,
+                  whatsappMessageId: replyTarget.whatsappMessageId,
+                  preview: replyPreview,
+                }
+              : null
+          }
+          onCancelReply={() => setReplyTarget(null)}
+          templateOnly={templateOnly}
+          windowExpiresAt={isSelf ? undefined : windowExpiresAt}
+          isSelf={isSelf}
+          onOptimisticAdd={handleOptimisticAdd}
+          onOptimisticSetStatus={handleOptimisticSetStatus}
+          lastKeyboardHeight={lastKeyboardHeight}
+          lastKeyboardDuration={lastKeyboardDuration}
+          onEmojiPickerOpenChange={onEmojiPickerOpenChange}
+          onMessageSent={() => {
+            if (isDraft) {
+              handleDraftMessageSent();
+              return;
+            }
+            (async () => {
+              try {
+                const result = await fetchConversationMessages(conversationId, area, 20);
+                const apiMessages = result.messages ?? [];
+                const newestFirst = [...apiMessages].reverse();
+                setMessagesInStore(conversationId, newestFirst);
+              } catch {
+                // ignore; optimistic bubble stays
+              }
+            })();
+          }}
+        />
+      </View>
+    </ImageBackground>
+  );
+
+  return (
+    <View style={[styles.container, { backgroundColor: colors.background }]}>
       <View
         style={[
           styles.header,
@@ -1231,25 +1344,49 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
       >
         <SafeAreaView
           edges={['top']}
-          style={[styles.headerSafe, { paddingTop: Math.max(6, insets.top ? 4 : 6) }]}
+          style={[styles.headerSafe, { paddingTop: Math.max(4, insets.top > 0 ? 2 : 4) }]}
         >
-          <View style={styles.headerLeft}>
-            <Pressable
-              onPress={() => navigation.goBack()}
-              style={({ pressed }) => [styles.iconBtn, pressed && styles.iconBtnPressed]}
-              android_ripple={{ color: 'rgba(255,255,255,0.10)' }}
-              accessibilityRole="button"
-              accessibilityLabel="Back"
-            >
-              <Ionicons name="chevron-back" size={24} color={ui.text} />
-            </Pressable>
-            <View style={styles.avatar}>
-              {headerAvatarUri ? (
-                <Image source={{ uri: headerAvatarUri }} style={styles.avatarImage} />
-              ) : (
-                <Text style={[styles.avatarText, { color: ui.textMuted }]}>
-                  {getInitials(headerTitle)}
-                </Text>
+          <Pressable
+            onPress={() => navigation.goBack()}
+            style={({ pressed }) => [styles.backBtn, pressed && styles.iconBtnPressed]}
+            android_ripple={{ color: 'rgba(0,0,0,0.06)' }}
+            accessibilityRole="button"
+            accessibilityLabel="Back"
+            hitSlop={6}
+          >
+            <Ionicons name="chevron-back" size={26} color={ui.text} />
+          </Pressable>
+
+          <Pressable
+            style={styles.headerCenter}
+            onPress={
+              headerShowTemplateOnly
+                ? () =>
+                    Alert.alert(
+                      'Template only',
+                      'The 24-hour messaging window has expired. You can only send approved templates until the contact replies.',
+                    )
+                : undefined
+            }
+            accessibilityRole={headerShowTemplateOnly ? 'button' : 'header'}
+            accessibilityLabel={
+              headerShowTemplateOnly
+                ? `${headerTitle}. Template only messaging.`
+                : headerTitle
+            }
+          >
+            <View style={styles.avatarWrap}>
+              <View style={styles.avatar}>
+                {headerAvatarUri ? (
+                  <Image source={{ uri: headerAvatarUri }} style={styles.avatarImage} />
+                ) : (
+                  <Text style={[styles.avatarText, { color: ui.textMuted }]}>
+                    {getInitials(headerTitle)}
+                  </Text>
+                )}
+              </View>
+              {headerShowTemplateOnly && (
+                <View style={[styles.templateOnlyDot, { borderColor: ui.headerBg }]} />
               )}
             </View>
             <View style={styles.headerTextBlock}>
@@ -1262,13 +1399,9 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                 </Text>
               )}
             </View>
-          </View>
+          </Pressable>
+
           <View style={styles.headerRight}>
-            {headerShowTemplateOnly && (
-              <View style={styles.templatePill}>
-                <Text style={styles.templatePillText}>Template only</Text>
-              </View>
-            )}
             {canInitiateCall && (
               <Pressable
                 onPress={handleCallPress}
@@ -1277,7 +1410,7 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
                   styles.iconBtn,
                   (pressed || callBusy) && styles.iconBtnPressed,
                 ]}
-                android_ripple={{ color: 'rgba(255,255,255,0.10)' }}
+                android_ripple={{ color: 'rgba(0,0,0,0.06)' }}
                 accessibilityRole="button"
                 accessibilityLabel="Call"
               >
@@ -1291,11 +1424,11 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
             <Pressable
               onPress={() => setShowHeaderMenu(true)}
               style={({ pressed }) => [styles.iconBtn, pressed && styles.iconBtnPressed]}
-              android_ripple={{ color: 'rgba(255,255,255,0.10)' }}
+              android_ripple={{ color: 'rgba(0,0,0,0.06)' }}
               accessibilityRole="button"
               accessibilityLabel="More options"
             >
-              <Ionicons name="ellipsis-vertical" size={20} color={ui.textMuted} />
+              <Ionicons name="ellipsis-vertical" size={20} color={ui.text} />
             </Pressable>
           </View>
         </SafeAreaView>
@@ -1388,72 +1521,7 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
         </TouchableWithoutFeedback>
       </Modal>
 
-      <View style={[styles.chatArea, { backgroundColor: ui.bg }]}>
-        {loading && (
-          <View style={styles.center}>
-            <ActivityIndicator size="small" color={colors.primary} />
-          </View>
-        )}
-        {error && !loading && <Text style={styles.error}>{error}</Text>}
-        {!loading && !error && (
-          <FlatList
-            data={messages}
-            keyExtractor={(item) => item.id}
-            renderItem={renderMessage}
-            inverted
-            onEndReached={loadOlder}
-            onEndReachedThreshold={0.3}
-            ListHeaderComponent={renderHeader}
-            contentContainerStyle={styles.listContent}
-            keyboardShouldPersistTaps="handled"
-            removeClippedSubviews={Platform.OS === 'android'}
-            initialNumToRender={14}
-            maxToRenderPerBatch={14}
-            windowSize={10}
-          />
-        )}
-      </View>
-
-      <MessageComposer
-        conversationId={conversationId}
-        participantPhone={participantPhone}
-        area={area}
-        businessPhoneId={conversationFromStore?.businessPhoneId}
-        replyTo={
-          replyTarget && replyPreview
-            ? {
-                id: replyTarget.id,
-                // Pass wamid so backend can create a native WhatsApp threaded reply
-                whatsappMessageId: replyTarget.whatsappMessageId,
-                preview: replyPreview,
-              }
-            : null
-        }
-        onCancelReply={() => setReplyTarget(null)}
-        templateOnly={templateOnly}
-        windowExpiresAt={isSelf ? undefined : windowExpiresAt}
-        isSelf={isSelf}
-        onOptimisticAdd={handleOptimisticAdd}
-        onOptimisticSetStatus={handleOptimisticSetStatus}
-        onMessageSent={() => {
-          if (isDraft) {
-            handleDraftMessageSent();
-            return;
-          }
-          // After a successful send, refresh to replace the optimistic bubble
-          // with the real one from the server (which has the real id + status).
-          (async () => {
-            try {
-              const result = await fetchConversationMessages(conversationId, area, 20);
-              const apiMessages = result.messages ?? [];
-              const newestFirst = [...apiMessages].reverse();
-              setMessagesInStore(conversationId, newestFirst);
-            } catch {
-              // ignore; optimistic bubble stays
-            }
-          })();
-        }}
-      />
+      {chatShell}
 
       <Modal
         visible={!!reactionTarget}
@@ -1724,11 +1792,11 @@ export function ConversationDetailScreen({ route, navigation }: Props) {
           </View>
         </TouchableWithoutFeedback>
       </Modal>
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
-function createDetailStyles(colors: AppColors) {
+function createDetailStyles(colors: AppColors, isDark: boolean) {
   return StyleSheet.create({
   container: {
     flex: 1,
@@ -1736,51 +1804,62 @@ function createDetailStyles(colors: AppColors) {
   },
   keyboardContainer: {
     flex: 1,
+    backgroundColor: 'transparent',
   },
   header: {
-    backgroundColor: colors.backgroundSecondary,
+    backgroundColor: colors.background,
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: colors.border,
   },
   headerSafe: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingTop: 8,
+    paddingLeft: 4,
+    paddingRight: 8,
     paddingBottom: 8,
-    minHeight: 56,
+    minHeight: 52,
   },
-  headerLeft: {
+  backBtn: {
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 2,
+  },
+  headerCenter: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
-    flex: 1,
-  },
-  iconBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    alignItems: 'center',
-    justifyContent: 'center',
+    minWidth: 0,
     marginRight: 4,
   },
-  iconBtnPressed: {
-    backgroundColor: 'rgba(0,0,0,0.06)',
-  },
-  avatar: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: colors.background,
+  iconBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  iconBtnPressed: {
+    backgroundColor: isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
+  },
+  avatarWrap: {
+    position: 'relative',
     marginRight: 10,
+  },
+  avatar: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: colors.backgroundSecondary,
+    alignItems: 'center',
+    justifyContent: 'center',
     overflow: 'hidden',
   },
   avatarImage: {
     width: '100%',
     height: '100%',
-    borderRadius: 18,
+    borderRadius: 20,
     resizeMode: 'cover',
   },
   avatarText: {
@@ -1790,33 +1869,33 @@ function createDetailStyles(colors: AppColors) {
   },
   headerTextBlock: {
     flex: 1,
+    minWidth: 0,
   },
   headerTitle: {
     fontSize: 17,
-    fontWeight: '700',
+    fontWeight: '600',
     color: colors.text,
   },
   headerSubtitle: {
     fontSize: 13,
     color: colors.textMuted,
-    marginTop: 2,
+    marginTop: 1,
   },
   headerRight: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginLeft: 12,
+    gap: 2,
+    flexShrink: 0,
   },
-  templatePill: {
-    backgroundColor: '#FDE6E6',
-    borderRadius: 12,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    marginRight: 8,
-  },
-  templatePillText: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: '#D93025',
+  templateOnlyDot: {
+    position: 'absolute',
+    right: -1,
+    bottom: -1,
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: '#EA4335',
+    borderWidth: 2.5,
   },
   readersContainer: {
     flexDirection: 'row',
@@ -1929,7 +2008,58 @@ function createDetailStyles(colors: AppColors) {
   },
   chatArea: {
     flex: 1,
-    backgroundColor: '#EFEAE2',
+  },
+  chatAreaInner: {
+    flex: 1,
+  },
+  chatWallpaperImage: {
+    resizeMode: 'cover',
+  },
+  chatList: {
+    flex: 1,
+    backgroundColor: 'transparent',
+  },
+  emptyChatState: {
+    position: 'absolute',
+    top: 12,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 1,
+    paddingHorizontal: 28,
+  },
+  emptyChatBanner: {
+    marginTop: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+    borderRadius: 10,
+    maxWidth: 300,
+    alignItems: 'center',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.08,
+        shadowRadius: 3,
+      },
+      android: {
+        elevation: 2,
+      },
+    }),
+  },
+  emptyChatBannerIcon: {
+    marginBottom: 8,
+  },
+  emptyChatBannerTitle: {
+    fontSize: 15,
+    fontWeight: '600',
+    textAlign: 'center',
+    marginBottom: 4,
+  },
+  emptyChatBannerSubtitle: {
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: 'center',
   },
   center: {
     flex: 1,
@@ -1943,8 +2073,11 @@ function createDetailStyles(colors: AppColors) {
   },
   listContent: {
     paddingHorizontal: 12,
-    paddingVertical: 10,
-    paddingBottom: 18,
+    paddingTop: 6,
+    paddingBottom: 10,
+  },
+  listContentEmpty: {
+    flexGrow: 1,
   },
   bubbleWrap: {
     marginVertical: 4,
@@ -2185,10 +2318,9 @@ function createDetailStyles(colors: AppColors) {
   },
   dateChipWrap: {
     alignSelf: 'center',
-    backgroundColor: '#E1E4EA',
-    borderRadius: 12,
+    borderRadius: 8,
     paddingHorizontal: 12,
-    paddingVertical: 4,
+    paddingVertical: 5,
     marginVertical: 8,
   },
   dateChipText: {
